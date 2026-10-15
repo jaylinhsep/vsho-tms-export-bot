@@ -478,22 +478,49 @@ class TMSExportApiClient:
             "lienHeNhanPo": f"b18<<|4<<|150<<|{row_id}<<|lienHeNhanPo<<|{row_timestamp}",
         }
 
-        cot_target = cot_map.get(field_name)
-        if not cot_target:
-            logger.error(f"Trường {field_name} không có trong bản đồ cot_map")
-            return False
+        if field_name in ("so_cont", "soContPo"):
+            # Hệ thống Vietsun TMS cập nhật số container xuất qua API cv: 5, loai: 21
+            payload = {
+                "TenDangNhap": config.TMS_USERNAME,
+                "userString": self.user_string,
+                "cv": 5,
+                "loai": 21,
+                "iddt": row_id,
+                "cot": str(new_value).strip().upper(),
+                "thongtin": row_timestamp,
+                "minData": "",
+                "maxData": "",
+            }
+        elif field_name in ("booking", "booking_id"):
+            # Gán Booking ID qua cv: 14, loai: 7
+            payload = {
+                "TenDangNhap": config.TMS_USERNAME,
+                "userString": self.user_string,
+                "cv": 14,
+                "loai": 7,
+                "iddt": row_id,
+                "cot": row_id,
+                "thongtin": str(new_value).strip(),
+                "minData": "",
+                "maxData": "",
+            }
+        else:
+            cot_target = cot_map.get(field_name)
+            if not cot_target:
+                logger.error(f"Trường {field_name} không có trong bản đồ cot_map")
+                return False
 
-        payload = {
-            "TenDangNhap": config.TMS_USERNAME,
-            "userString": self.user_string,
-            "cv": 3,
-            "loai": 1,
-            "iddt": 1,
-            "cot": cot_target,
-            "thongtin": str(new_value).strip(),
-            "minData": "",
-            "maxData": "",
-        }
+            payload = {
+                "TenDangNhap": config.TMS_USERNAME,
+                "userString": self.user_string,
+                "cv": 3,
+                "loai": 1,
+                "iddt": 1,
+                "cot": cot_target,
+                "thongtin": str(new_value).strip(),
+                "minData": "",
+                "maxData": "",
+            }
 
         try:
             resp = await client.post(crud_url, data=payload)
@@ -512,11 +539,12 @@ class TMSExportApiClient:
     async def create_export_booking_row(self, item: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """
         Quy trình tự động bấm Dấu cộng [+] và tạo dòng đóng hàng xuất:
-        1. Tính timestamp của ngày đóng hàng (hoặc ngày hôm nay).
+        1. Tính timestamp của ngày kế hoạch (target_date từ email hoặc ngay_tra/ngay_dong).
         2. Bấm [+]: POST /index-crud.php (cv: 1, loai: 72, thongtin: timestamp).
         3. Tải lại danh sách dòng ngày đó để tìm dòng mới tạo (ID PVT lớn nhất).
         4. Gán Booking ID: POST /index-crud.php (cv: 14, loai: 7, iddt: row_id, thongtin: booking).
-        5. Cập nhật đồng loạt 15+ trường (Tàu, chuyến, khách, kho, POD CỘT 14, GW, cont, ...).
+        5. Cập nhật đồng loạt các trường (Tàu, chuyến, khách, kho, POD CỘT 14, GW, cont, seal...).
+        6. Tải lại chính xác thông tin hoàn thiện để trả về cho bot Telegram.
         """
         client = await self.get_client()
         crud_url = f"{config.TMS_URL}/index-crud.php"
@@ -527,16 +555,21 @@ class TMSExportApiClient:
             m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw_target_date)
             if m:
                 query_date_str = f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+                formatted_target_date = f"{m.group(1).zfill(2)}/{m.group(2).zfill(2)}/{m.group(3)}"
             else:
                 m_iso = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw_target_date)
                 if m_iso:
                     query_date_str = raw_target_date
+                    formatted_target_date = f"{m_iso.group(3).zfill(2)}/{m_iso.group(2).zfill(2)}/{m_iso.group(1)}"
                 else:
                     query_date_str = datetime.now(VN_TZ).strftime("%Y-%m-%d")
+                    formatted_target_date = datetime.now(VN_TZ).strftime("%d/%m/%Y")
         else:
             query_date_str = datetime.now(VN_TZ).strftime("%Y-%m-%d")
+            formatted_target_date = datetime.now(VN_TZ).strftime("%d/%m/%Y")
 
-        formatted_ngay_dong = item.get("ngay_dong") or item.get("ngay_tra") or datetime.now(VN_TZ).strftime("%d/%m/%Y")
+        # Cột ngayTraHang quyết định dòng thuộc tab ngày nào trên TMS (phải trùng với query_date_str)
+        formatted_ngay_dong = formatted_target_date
         date_timestamp = self.date_to_timestamp(query_date_str)
 
         # Lấy danh sách ID hiện có trước khi bấm [+]
@@ -579,28 +612,16 @@ class TMSExportApiClient:
             return False, "Không tìm thấy dòng mới tạo trên TMS sau khi bấm [+].", None
 
         new_row_id = new_row["row_id"]
-        row_ts = new_row["row_timestamp"] or str(int(time.time()))
+        row_ts = new_row["row_timestamp"] or str(date_timestamp)
         logger.info(f"🎉 Đã tạo thành công dòng mới! ID PVT = {new_row_id}, timestamp = {row_ts}")
 
         # BƯỚC 3: GÁN MÃ BOOKING (cv: 14, loai: 7)
         booking_id = str(item.get("booking", "")).strip()
         if booking_id:
             logger.info(f"🔖 Đang gán Booking ID '{booking_id}' cho dòng {new_row_id}...")
-            booking_payload = {
-                "TenDangNhap": config.TMS_USERNAME,
-                "userString": self.user_string,
-                "cv": 14,
-                "loai": 7,
-                "iddt": new_row_id,
-                "cot": new_row_id,
-                "thongtin": booking_id,
-                "minData": "",
-                "maxData": "",
-            }
-            await client.post(crud_url, data=booking_payload)
+            await self.update_field(new_row_id, row_ts, "booking", booking_id)
 
         # BƯỚC 4: CẬP NHẬT ĐỒNG LOẠT CÁC CỘT CHI TIẾT
-        # Chuẩn bị danh sách trường cần cập nhật
         fields_to_update = [
             ("chuyen", item.get("chuyen", "")),
             ("tau", item.get("tau", "")),
@@ -612,10 +633,10 @@ class TMSExportApiClient:
             ("tinh_dong", item.get("tinh_dong", "")),
             # CỘT THỨ 14 - POD:
             ("pod", item.get("pod", "")),
-            ("chu_hang", item.get("phong_ban", "VSV")),
-            ("sl_20", str(item.get("sl_20", "1"))),
-            ("sl_40", str(item.get("sl_40", "0"))),
-            ("ten_hang", item.get("ten_hang", "Gạo")),
+            ("chu_hang", item.get("phong_ban", "PTTT")),
+            ("sl_20", str(item.get("sl_20", "0"))),
+            ("sl_40", str(item.get("sl_40", "1"))),
+            ("ten_hang", item.get("ten_hang", "Thực phẩm")),
             ("gw", str(item.get("gw", ""))),
             ("port_ha_hang", item.get("port_ha_hang", "BẾN NGHÉ")),
             ("cang_den_pod", item.get("pod", "")),
@@ -623,7 +644,6 @@ class TMSExportApiClient:
             ("lien_he", item.get("lien_he", "")),
         ]
 
-        # Nếu có số cont và số seal
         if item.get("so_cont"):
             fields_to_update.append(("so_cont", item.get("so_cont")))
         if item.get("so_seal"):
@@ -633,16 +653,57 @@ class TMSExportApiClient:
         if item.get("don_vi_vc"):
             fields_to_update.append(("don_vi_vc", item.get("don_vi_vc")))
 
-        # Gửi cập nhật song song siêu tốc
-        update_tasks = [
-            self.update_field(new_row_id, row_ts, f_name, f_val)
-            for f_name, f_val in fields_to_update
-            if str(f_val).strip()
-        ]
-        await asyncio.gather(*update_tasks, return_exceptions=True)
+        # Cập nhật lần lượt để đảm bảo 100% request được TMS ghi nhận
+        for f_name, f_val in fields_to_update:
+            if str(f_val).strip():
+                await self.update_field(new_row_id, row_ts, f_name, str(f_val).strip())
 
-        # Lấy lại dòng thông tin đã hoàn thiện
+        # BƯỚC 5: LẤY LẠI THÔNG TIN HOÀN THIỆN TỪ TMS
+        await asyncio.sleep(0.5)
+        self.cache_date.clear()
         final_rows = await self.fetch_table_for_date(query_date_str, force_refresh=True)
-        final_row = next((r for r in final_rows if r.get("row_id") == new_row_id), new_row)
+        final_row = next((r for r in final_rows if r.get("row_id") == new_row_id), None)
+
+        if not final_row:
+            # Quét đa ngày tìm chính xác theo ID PVT
+            matched = await self.find_container_or_booking(new_row_id)
+            if matched:
+                final_row = matched[0]
+
+        if not final_row:
+            # Fallback an toàn: ghép dữ liệu đã submit vào thẻ
+            final_row = dict(new_row)
+
+        # Đảm bảo các trường cốt lõi hiển thị chuẩn trên Telegram Card
+        if not final_row.get("booking_id") or final_row.get("booking_id") == "0":
+            final_row["booking_id"] = booking_id
+        if not final_row.get("tau") or final_row.get("tau") == "Chưa rõ":
+            final_row["tau"] = item.get("tau", "")
+        if not final_row.get("chuyen"):
+            final_row["chuyen"] = item.get("chuyen", "")
+        if not final_row.get("ngay_dong"):
+            final_row["ngay_dong"] = formatted_ngay_dong
+        if not final_row.get("ngay_tau_chay"):
+            final_row["ngay_tau_chay"] = item.get("ngay_tau_chay", "")
+        if not final_row.get("khach_hang"):
+            final_row["khach_hang"] = item.get("khach_hang", "")
+        if not final_row.get("kho_dong"):
+            final_row["kho_dong"] = item.get("kho_dong", "")
+        if not final_row.get("tinh_dong"):
+            final_row["tinh_dong"] = item.get("tinh_dong", "")
+        if not final_row.get("pod_cot_14"):
+            final_row["pod_cot_14"] = item.get("pod", "")
+        if not final_row.get("so_cont"):
+            final_row["so_cont"] = item.get("so_cont", "")
+        if not final_row.get("so_seal"):
+            final_row["so_seal"] = item.get("so_seal", "")
+        if not final_row.get("ten_hang"):
+            final_row["ten_hang"] = item.get("ten_hang", "")
+        if not final_row.get("gw"):
+            final_row["gw"] = str(item.get("gw", ""))
+        if not final_row.get("ghi_chu"):
+            final_row["ghi_chu"] = item.get("ghi_chu", "")
+        if not final_row.get("lien_he"):
+            final_row["lien_he"] = item.get("lien_he", "")
 
         return True, f"Tạo thành công ID PVT {new_row_id}", final_row

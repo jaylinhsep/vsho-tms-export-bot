@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: vsho-export-tms-bot
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:web_app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TMS_URL
+        value: https://vsho.vietsunlogistics.com
+      - key: TMS_USERNAME
+        value: trucking14
+      - key: TMS_PASSWORD
+        value: "1"

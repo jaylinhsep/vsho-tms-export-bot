@@ -56,9 +56,14 @@ def build_container_card(r: Dict[str, Any]) -> str:
     kho = r.get("kho_dong", "") or "Chưa có"
     tinh = r.get("tinh_dong", "") or ""
     pod_14 = r.get("pod_cot_14", "") or "*(Chưa gán)*"
-    sl20 = r.get("sl_20", "0")
-    sl40 = r.get("sl_40", "0")
-    sl_str = f"{sl20}x20ft" if sl20 and sl20 != "0" else (f"{sl40}x40ft" if sl40 and sl40 != "0" else "Chưa rõ")
+    sl20 = str(r.get("sl_20", "")).strip()
+    sl40 = str(r.get("sl_40", "")).strip()
+    sl_parts = []
+    if sl20 and sl20 != "0":
+        sl_parts.append(f"{sl20}x20ft")
+    if sl40 and sl40 != "0":
+        sl_parts.append(f"{sl40}x40ft")
+    sl_str = " + ".join(sl_parts) if sl_parts else "Chưa rõ"
     gw = r.get("gw", "")
     cont = r.get("so_cont", "") or "*(Chưa gán)*"
     seal = r.get("so_seal", "") or "*(Chưa có)*"

@@ -112,7 +112,7 @@ class TMSExportApiClient:
         return int(dt.timestamp())
 
     def _parse_row(self, row_chunk: str, date_queried: str = "") -> Optional[Dict[str, Any]]:
-        """Phân tích HTML 1 dòng tr trong tab XUẤT - ALL"""
+        """Phân tích HTML 1 dòng tr trong tab XUẤT - ALL bằng cách đọc toàn bộ input và span"""
         m_row = re.search(r'id="tr(\d+)"', row_chunk)
         if not m_row:
             return None
@@ -122,88 +122,92 @@ class TMSExportApiClient:
         m_ts = re.search(r'data-id="b18[^"]*<<\|(\d{9,11})"', row_chunk)
         row_timestamp = m_ts.group(1) if m_ts else ""
 
-        # 1. Mã Booking (cột Booking - input readonly name="name15")
-        m_booking = re.search(r'name="name15">([^<]*)</span>', row_chunk) or re.search(r'<td[^>]*><input[^>]*value="([^"]*)"[^>]*readonly', row_chunk)
-        booking_id = m_booking.group(1).strip() if m_booking else ""
+        # Bóc tách tất cả thẻ input trong dòng theo data-id hoặc id
+        input_values: Dict[str, str] = {}
+        for m_inp in re.finditer(r'<input\b([^>]*)>', row_chunk):
+            attr_str = m_inp.group(1)
+            m_v = re.search(r'value="([^"]*)"', attr_str)
+            val = m_v.group(1).strip() if m_v else ""
+
+            m_d = re.search(r'data-id="([^"]*)"', attr_str)
+            if m_d:
+                did = m_d.group(1)
+                parts = did.split("<<|")
+                col_name = parts[4] if len(parts) >= 5 else did
+                input_values[col_name] = val
+
+            m_id = re.search(r'id="([^"]*)"', attr_str)
+            if m_id:
+                elem_id = m_id.group(1)
+                input_values[elem_id] = val
+
+        # Bóc tách các thẻ span (name="name...") làm fallback
+        span_values: Dict[str, str] = {}
+        for m_sp in re.finditer(r'<span[^>]*name="([^"]*)"[^>]*>([^<]*)</span>', row_chunk):
+            span_name = m_sp.group(1)
+            span_val = m_sp.group(2).strip()
+            span_values[span_name] = span_val
+
+        # 1. Mã Booking (cột Booking - span name="name15" hoặc input readonly)
+        booking_id = span_values.get("name15", "")
+        if not booking_id:
+            m_b = re.search(r'<td[^>]*><input[^>]*value="([^"]*)"[^>]*readonly', row_chunk)
+            booking_id = m_b.group(1).strip() if m_b else ""
 
         # 2. Tàu, Chuyến, Lines
-        m_tau = re.search(r'tauPo[^>]*value="([^"]*)"', row_chunk)
-        tau = m_tau.group(1).strip() if m_tau else ""
-
-        m_chuyen = re.search(r'chuyenPo[^>]*value="([^"]*)"', row_chunk)
-        chuyen = m_chuyen.group(1).strip() if m_chuyen else ""
-
-        m_line = re.search(r'linePoDh[^>]*value="([^"]*)"', row_chunk)
-        lines = m_line.group(1).strip() if m_line else ""
+        tau = input_values.get("tauPo") or span_values.get("name9", "")
+        chuyen = input_values.get("chuyenPo") or span_values.get("name8", "")
+        lines = input_values.get("linePoDh") or span_values.get("name10", "VIETSUN")
 
         # 3. Ngày đóng & Ngày tàu chạy
-        m_ngay_dong = re.search(r'ngayTraHang[^>]*value="([^"]*)"', row_chunk)
-        ngay_dong = m_ngay_dong.group(1).strip() if m_ngay_dong else ""
-
-        m_ngay_chay = re.search(r'ngayTauChayPo[^>]*value="([^"]*)"', row_chunk)
-        ngay_tau_chay = m_ngay_chay.group(1).strip() if m_ngay_chay else ""
+        ngay_dong = input_values.get("ngayTraHang") or span_values.get("name11", "")
+        ngay_tau_chay = input_values.get("ngayTauChayPo") or span_values.get("name12", "")
 
         # 4. Khách hàng, Địa chỉ kho, Tỉnh
-        m_khach = re.search(r'tenKhachPo[^>]*value="([^"]*)"', row_chunk)
-        khach_hang = m_khach.group(1).strip() if m_khach else ""
-
-        m_kho = re.search(r'diaChiNhanPo[^>]*value="([^"]*)"', row_chunk)
-        kho_dong = m_kho.group(1).strip() if m_kho else ""
-
-        m_tinh = re.search(r'tinhNhanPo[^>]*value="([^"]*)"', row_chunk)
-        tinh_dong = m_tinh.group(1).strip() if m_tinh else ""
+        khach_hang = input_values.get("tenKhachPo") or span_values.get("name1", "")
+        kho_dong = input_values.get("diaChiNhanPo") or span_values.get("name13", "")
+        tinh_dong = input_values.get("tinhNhanPo") or span_values.get("name14", "")
 
         # 5. CỘT THỨ 14 - POD / TỈNH XUẤT HÀNG (tinhXuatHangPo: CLO, HPH, DNG...)
-        m_pod_14 = re.search(r'tinhXuatHangPo[^>]*value="([^"]*)"', row_chunk)
-        pod_cot_14 = m_pod_14.group(1).strip() if m_pod_14 else ""
+        pod_cot_14 = input_values.get("tinhXuatHangPo") or span_values.get("name16", "")
 
         # 6. Chủ hàng (chuHangPo: VSV...)
-        m_chu = re.search(r'chuHangPo[^>]*value="([^"]*)"', row_chunk)
-        chu_hang = m_chu.group(1).strip() if m_chu else ""
+        chu_hang = input_values.get("chuHangPo") or span_values.get("name2", "")
 
         # 7. Sản lượng 20 / 40
-        m_sl20 = re.search(r'cont20Po[^>]*value="([^"]*)"', row_chunk)
-        sl_20 = m_sl20.group(1).strip() if m_sl20 else ""
-
-        m_sl40 = re.search(r'cont40Po[^>]*value="([^"]*)"', row_chunk)
-        sl_40 = m_sl40.group(1).strip() if m_sl40 else ""
+        sl_20 = input_values.get("cont20Po") or span_values.get("name21", "")
+        sl_40 = input_values.get("cont40Po") or span_values.get("name22", "")
 
         # 8. Hàng hóa & Trọng lượng GW
-        m_hang = re.search(r'tenHangHoaPo[^>]*value="([^"]*)"', row_chunk)
-        ten_hang = m_hang.group(1).strip() if m_hang else ""
-
-        m_gw = re.search(r'trongLuongPo[^>]*value="([^"]*)"', row_chunk)
-        gw = m_gw.group(1).strip() if m_gw else ""
+        ten_hang = input_values.get("tenHangHoaPo") or span_values.get("name18", "")
+        gw = input_values.get("trongLuongPo") or span_values.get("name19", "")
 
         # 9. Số container & Số seal
-        m_cont = re.search(r'soContPo[^>]*value="([^"]*)"', row_chunk)
-        raw_cont = m_cont.group(1).strip() if m_cont else ""
+        raw_cont = input_values.get("soContPo", "")
+        if not raw_cont:
+            m_c = re.search(r'id="soContPo\d+"[^>]*value="([^"]*)"', row_chunk)
+            raw_cont = m_c.group(1).strip() if m_c else ""
         clean_cont = re.sub(r"\s+", "", raw_cont).upper()
 
-        m_seal = re.search(r'soSealPo[^>]*value="([^"]*)"', row_chunk)
-        so_seal = m_seal.group(1).strip() if m_seal else ""
+        so_seal = input_values.get("soSealPo", "")
 
         # 10. Nơi hạ hàng / Port hạ hàng & Cảng đến POD phụ
-        m_cang_di = re.search(r'cangDiPo[^>]*value="([^"]*)"', row_chunk)
-        port_ha_hang = m_cang_di.group(1).strip() if m_cang_di else ""
-
-        m_cang_den = re.search(r'cangDenPo[^>]*value="([^"]*)"', row_chunk)
-        cang_den_pod = m_cang_den.group(1).strip() if m_cang_den else ""
+        port_ha_hang = input_values.get("cangDiPo") or span_values.get("name4", "")
+        cang_den_pod = input_values.get("cangDenPo", "")
 
         # 11. Đơn vị vận chuyển & Số xe
-        m_dvvc = re.search(r'donViVcPo[^>]*value="([^"]*)"', row_chunk)
-        don_vi_vc = m_dvvc.group(1).strip() if m_dvvc else ""
+        don_vi_vc = input_values.get("donViVcPo") or span_values.get("name5", "")
+        so_xe = input_values.get("soXePo", "")
+        if not so_xe:
+            m_x = re.search(r'id="soXePo\d+"[^>]*value="([^"]*)"', row_chunk)
+            so_xe = m_x.group(1).strip() if m_x else ""
 
-        m_xe = re.search(r'soXePo[^>]*value="([^"]*)"', row_chunk)
-        so_xe = m_xe.group(1).strip() if m_xe else ""
+        # 12. Liên hệ kho đóng (cột readonly)
+        m_lh = re.search(r'<td><input[^>]*value="([^"]*)"[^>]*readonly><span class="inputTitle2">', row_chunk)
+        lien_he = m_lh.group(1).strip() if m_lh else input_values.get("lienHeNhanPo", "")
 
-        # 12. Liên hệ kho đóng (ở cột gần cuối)
-        m_lh = re.search(r'<td><input[^>]*value="([^"]*)"\s+readonly><span class="inputTitle2">([^<]*)</span></td>\s*<td><input[^>]*noiDungPo', row_chunk)
-        lien_he = m_lh.group(1).strip() if m_lh else ""
-
-        # 13. Ghi chú đóng hàng (noiDungPo)
-        m_note = re.search(r'noiDungPo[^>]*value="([^"]*)"', row_chunk)
-        ghi_chu = m_note.group(1).strip() if m_note else ""
+        # 13. Ghi chú đóng hàng (noiDungPo hoặc ghiChuPo)
+        ghi_chu = input_values.get("noiDungPo") or input_values.get("ghiChuPo", "")
 
         return {
             "row_id": row_id,
@@ -260,6 +264,7 @@ class TMSExportApiClient:
                 await self.login()
                 resp = await client.post(ajax_url, data=payload)
 
+            resp.encoding = "utf-8"
             chunks = resp.text.split('<tr id="tr')
             rows = []
             for chunk in chunks[1:]:

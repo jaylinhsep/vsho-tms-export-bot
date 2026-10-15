@@ -521,26 +521,22 @@ class TMSExportApiClient:
         client = await self.get_client()
         crud_url = f"{config.TMS_URL}/index-crud.php"
 
-        raw_ngay_dong = item.get("ngay_dong", "")
-        # Chuyển ngày dạng YYYY-MM-DD
-        dt_obj = None
-        if raw_ngay_dong:
-            m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw_ngay_dong)
+        # Ưu tiên target_date (ngày kế hoạch cụ thể trong email), sau đó đến ngay_tra hoặc ngay_dong
+        raw_target_date = item.get("target_date") or item.get("ngay_tra") or item.get("ngay_dong", "")
+        if raw_target_date:
+            m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw_target_date)
             if m:
                 query_date_str = f"{m.group(3)}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
-                formatted_ngay_dong = f"{m.group(1).zfill(2)}/{m.group(2).zfill(2)}/{m.group(3)}"
             else:
-                m_iso = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw_ngay_dong)
+                m_iso = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw_target_date)
                 if m_iso:
-                    query_date_str = raw_ngay_dong
-                    formatted_ngay_dong = f"{m_iso.group(3).zfill(2)}/{m_iso.group(2).zfill(2)}/{m_iso.group(1)}"
+                    query_date_str = raw_target_date
                 else:
                     query_date_str = datetime.now(VN_TZ).strftime("%Y-%m-%d")
-                    formatted_ngay_dong = datetime.now(VN_TZ).strftime("%d/%m/%Y")
         else:
             query_date_str = datetime.now(VN_TZ).strftime("%Y-%m-%d")
-            formatted_ngay_dong = datetime.now(VN_TZ).strftime("%d/%m/%Y")
 
+        formatted_ngay_dong = item.get("ngay_dong") or item.get("ngay_tra") or datetime.now(VN_TZ).strftime("%d/%m/%Y")
         date_timestamp = self.date_to_timestamp(query_date_str)
 
         # Lấy danh sách ID hiện có trước khi bấm [+]

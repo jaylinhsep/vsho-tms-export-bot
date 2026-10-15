@@ -339,22 +339,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.edit_text(f"❌ Cập nhật thất bại. Vui lòng thử lại sau.")
         return
 
-    # 2. Nhận diện nếu là Email kế hoạch đóng hàng (chứa từ khóa đặc trưng)
-    email_keywords = ["BOOKING", "ĐÓNG HÀNG", "CHUYẾN", "TÀU", "KH ĐÓNG HÀNG", "SẢN LƯỢNG"]
-    is_email = any(k in text.upper() for k in email_keywords) and ("---" in text or "CHI TIẾT" in text.upper() or "\t" in text or "|" in text)
+    # 2. Nếu là 1 chuỗi ngắn (Số cont hoặc Booking đơn lẻ trên 1 dòng) ➔ Tra cứu nhanh
+    clean_text = text.replace(" ", "").upper()
+    if len(clean_text) <= 15 and "\n" not in text:
+        await handle_query_search(update, text)
+        return
+
+    # 3. Nhận diện nếu là Email kế hoạch đóng hàng / trả hàng
+    email_keywords = ["BOOKING", "ĐÓNG HÀNG", "TRẢ HÀNG", "CHUYẾN", "TÀU", "KH ĐÓNG HÀNG", "KH TRẢ HÀNG", "SẢN LƯỢNG", "KẾ HOẠCH"]
+    has_keywords = any(k in text.upper() for k in email_keywords)
+    has_structure = "---" in text or "CHI TIẾT" in text.upper() or "\t" in text or "|" in text or len(text.splitlines()) >= 3
+    is_email = (has_keywords and has_structure) or (bool(re.search(r"\b\d{6}\b", text)) and len(text.splitlines()) >= 3)
 
     if is_email:
         await handle_email_import(update, text_content=text)
         return
 
-    # 3. Nếu là 1 chuỗi ngắn (Số cont hoặc Booking) ➔ Tra cứu nhanh
-    clean_text = text.replace(" ", "").upper()
-    if len(clean_text) <= 15:
+    # 4. Mặc định: Thử tra cứu nếu ngắn, hoặc phân tích kế hoạch nếu nhiều dòng
+    if len(text.splitlines()) > 1:
+        await handle_email_import(update, text_content=text)
+    else:
         await handle_query_search(update, text)
-        return
-
-    # 4. Nếu không rõ, thử phân tích qua AI xem có phải email đóng hàng không
-    await handle_email_import(update, text_content=text)
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

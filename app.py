@@ -393,7 +393,28 @@ async def handle_email_import(update: Update, text_content: Optional[str] = None
             return
 
         total = len(bookings)
-        await wait_msg.edit_text(f"📋 **Tìm thấy {total} cont/booking cần tạo kế hoạch:**\nĐang tự động bấm `[+]` và đẩy dữ liệu lên TMS Vietsun...", parse_mode="Markdown")
+        summary_lines = []
+        for i, b in enumerate(bookings, start=1):
+            b_id = b.get("booking", "N/A")
+            b_tau = b.get("tau", "")
+            b_chuyen = b.get("chuyen", "")
+            b_cont = b.get("so_cont") or "Chưa có"
+            b_pod = b.get("pod") or "N/A"
+            b_khach = b.get("khach_hang", "")
+            summary_lines.append(f"{i}. 🔖 `{b_id}` | {b_tau} ({b_chuyen}) | Cont: `{b_cont}` | ⚓ POD: `{b_pod}`{f' | {b_khach}' if b_khach else ''}")
+
+        preview_text = "\n".join(summary_lines[:15])
+        if total > 15:
+            preview_text += f"\n... và {total - 15} booking khác."
+
+        await wait_msg.edit_text(
+            f"📋 **ĐÃ NHẬN DIỆN {total} BOOKING TỪ EMAIL:**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{preview_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ Đang tự động bấm `[+]` và đẩy từng dòng lên TMS...",
+            parse_mode="Markdown"
+        )
 
         if not tms_api.is_logged_in:
             await tms_api.login()

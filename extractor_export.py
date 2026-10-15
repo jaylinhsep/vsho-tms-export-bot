@@ -122,15 +122,17 @@ def extract_booking_plan_deterministic(text: str) -> List[Dict[str, Any]]:
     true_booking_indices = []
     for i, l in enumerate(lines):
         if re.match(r"^\d{6}$", l):
+            # Loại trừ số Seal: Nếu dòng trước đó là số container [A-Z]{4}\d{7} thì đây là seal
+            prev_is_cont = i > 0 and bool(re.match(r"^[A-Z]{4}\d{7}$", lines[i - 1]))
+            if prev_is_cont:
+                continue
+
+            # Phải có Chuyến (\d{3,4}[NSWE]) hoặc Tàu (VIETSUN) trong phạm vi 1 đến 4 dòng tiếp theo
             has_anchor = False
-            for step in range(1, 8):
+            for step in range(1, 5):
                 if i + step < len(lines):
                     next_l = lines[i + step]
-                    if (
-                        re.match(r"^\d{3,4}[NSWE]$", next_l)
-                        or "VIETSUN" in next_l.upper()
-                        or re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", next_l)
-                    ):
+                    if re.match(r"^\d{3,4}[NSWE]$", next_l) or "VIETSUN" in next_l.upper():
                         has_anchor = True
                         break
             if has_anchor:

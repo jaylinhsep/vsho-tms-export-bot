@@ -4,6 +4,7 @@ import time
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Set, Tuple
+import unicodedata
 import httpx
 
 import config
@@ -12,6 +13,16 @@ logger = logging.getLogger(__name__)
 
 # Múi giờ Việt Nam (UTC+7)
 VN_TZ = timezone(timedelta(hours=7))
+
+
+def remove_accents(input_str: str) -> str:
+    """Loại bỏ dấu tiếng Việt và chuẩn hóa chữ thường để tìm kiếm tương đối (fuzzy search)"""
+    if not input_str:
+        return ""
+    # Thay thế chữ đ/Đ trước khi normalize NFKD
+    s = str(input_str).replace("đ", "d").replace("Đ", "D")
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join([c for c in nfkd if not unicodedata.combining(c)]).strip().lower()
 
 class TMSExportApiClient:
     def __init__(self):
@@ -421,6 +432,61 @@ class TMSExportApiClient:
         logger.info(f"❌ Không tìm thấy kết quả nào cho '{clean_q}' trong phạm vi [-2 đến +5] ngày.")
         return []
 
+    async def find_containers_by_customer(self, customer_query: str) -> List[Dict[str, Any]]:
+        """
+        Tìm kiếm các container/booking theo Tên Khách Hàng (cột 10 trên TMS XUẤT - ALL).
+        Hỗ trợ tìm kiếm tương đối (không phân biệt hoa/thường, không phân biệt có dấu/không dấu tiếng Việt).
+        Ví dụ: 'Tiền', 'Phong', 'Tien', 'Cty Tiền Phong' đều khớp 'Cty Tiền Phong MN'.
+        Quét các ngày từ [hôm nay - 2 ngày] đến [hôm nay + 4 ngày].
+        """
+        clean_q = remove_accents(customer_query)
+        clean_q = clean_q.strip('"').strip("'").strip()
+        if not clean_q or len(clean_q) < 2:
+            return []
+
+        if not self.is_logged_in:
+            await self.login()
+
+        today = datetime.now(VN_TZ)
+        # Quét hôm nay trước, sau đó là các ngày lân cận (tương lai gần và quá khứ gần)
+        offsets = [0, 1, 2, 3, 4, -1, -2]
+
+        all_matched: List[Dict[str, Any]] = []
+        seen_row_ids: Set[str] = set()
+
+        logger.info(f"🔍 Đang quét hàng loạt cont theo Tên Khách Hàng '{customer_query}' (chuẩn hóa: '{clean_q}')...")
+
+        for d_offset in offsets:
+            d_str = (today + timedelta(days=d_offset)).strftime("%Y-%m-%d")
+            # Tải danh sách các dòng của ngày này (tận dụng bộ nhớ đệm cache_date nếu có)
+            rows = await self.fetch_table_for_date(d_str, force_refresh=False)
+            for r in rows:
+                row_id = r.get("row_id", "")
+                if not row_id or row_id in seen_row_ids:
+                    continue
+
+                kh = r.get("khach_hang", "")
+                chu_hang = r.get("chu_hang", "")
+
+                clean_kh = remove_accents(kh)
+                clean_chu = remove_accents(chu_hang)
+
+                # Khớp tương đối: từ khóa người dùng gõ nằm trong tên khách hàng hoặc chủ hàng
+                if (clean_q in clean_kh) or (clean_q in clean_chu):
+                    seen_row_ids.add(row_id)
+                    all_matched.append(r)
+
+        # Sắp xếp kết quả: ngày gần hôm nay nhất và row_id mới nhất lên đầu
+        all_matched.sort(
+            key=lambda x: (
+                x.get("date_queried", ""),
+                int(x.get("row_id", 0)) if str(x.get("row_id", "")).isdigit() else 0
+            ),
+            reverse=True
+        )
+
+        logger.info(f"✅ Đã tìm thấy {len(all_matched)} container cho khách hàng '{customer_query}'.")
+        return all_matched
 
     async def update_field(self, row_id: str, row_timestamp: str, field_name: str, new_value: str) -> bool:
         """

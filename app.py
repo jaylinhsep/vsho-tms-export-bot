@@ -1,3 +1,4 @@
+import re
 import time
 import asyncio
 import logging
@@ -120,8 +121,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚢 **Bot Quản Lý Hàng Xuất (VSHO TMS Vietsun)**\n\n"
         "⚡ **Tính năng chính:**\n"
         "1️⃣ **Nhập kế hoạch tự động:** Chỉ cần copy toàn bộ nội dung email kế hoạch đóng hàng (hoặc gửi ảnh chụp màn hình email) dán vào đây ➔ Bot tự động bấm `[+]` và điền toàn bộ thông tin lên TMS.\n\n"
-        "2️⃣ **Tra cứu cont xuất:** Gõ trực tiếp số cont (VD: `GAOU2111920`) hoặc mã booking (VD: `300170`), hoặc gõ lệnh `/tim <từ khóa>`.\n\n"
-        "3️⃣ **Chỉnh sửa & Submit ngược lại TMS:** Có sẵn nút bấm trực tiếp dưới mỗi kết quả tra cứu:\n"
+        "2️⃣ **Tra cứu cont xuất đơn lẻ:** Gõ trực tiếp số cont (VD: `GAOU2111920`) hoặc mã booking (VD: `300170`), hoặc gõ lệnh `/tim <từ khóa>`.\n\n"
+        "3️⃣ **Tra cứu hàng loạt theo Khách hàng:** Gõ `KH: <từ khóa>` (VD: `KH: Tiền`, `KH: Phong`, `KH: Cty Tiền Phong`) hoặc lệnh `/kh <từ khóa>` ➔ Bot trả về danh sách tất cả các cont của khách đó kèm nút bấm sửa trực tiếp từng cont!\n\n"
+        "4️⃣ **Chỉnh sửa & Submit ngược lại TMS:** Có sẵn nút bấm trực tiếp dưới mỗi kết quả tra cứu:\n"
         "   • ⚓ **Đổi POD (Gán vào Cột 14 TMS)**\n"
         "   • ✏️ **Gán / Đổi số cont**\n"
         "   • 🚚 **Gán biển số xe**\n"
@@ -130,6 +132,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 **Lệnh hữu ích:**\n"
         "• `/status` — Kiểm tra kết nối tài khoản TMS & số lượng cont xuất hôm nay\n"
         "• `/tim <từ khóa>` — Tra cứu cont xuất theo cont hoặc booking\n"
+        "• `/kh <tên khách>` — Tra cứu tất cả các cont của khách hàng (VD: `/kh Tiền`)\n"
         f"• Chat ID của bạn: `{chat_id}`"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -200,6 +203,27 @@ async def tim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_query_search(update, query)
 
 
+async def kh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh tra cứu hàng loạt container theo Tên Khách Hàng: /kh <tên khách>"""
+    if not is_authorized(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "👉 Vui lòng nhập tên khách hàng cần tìm.\n"
+            "Ví dụ:\n"
+            "• `/kh Tiền`\n"
+            "• `/kh Phong`\n"
+            "• `KH: Tiền Phong`\n"
+            "• `KH: \"Cty Tiền Phong MN\"`",
+            parse_mode="Markdown"
+        )
+        return
+
+    query = " ".join(context.args).strip().strip('"').strip("'").strip()
+    await handle_customer_search(update, query)
+
+
 async def handle_query_search(update: Update, query: str):
     """Tìm kiếm và hiển thị thẻ thông tin container xuất kèm nút chỉnh sửa"""
     wait_msg = await update.message.reply_text(f"🔍 Đang tra cứu `{query}` trên tab XUẤT - ALL của TMS...")
@@ -228,6 +252,88 @@ async def handle_query_search(update: Update, query: str):
     except Exception as e:
         logger.exception(f"Lỗi khi tra cứu: {e}")
         await wait_msg.edit_text(f"❌ Đã xảy ra lỗi khi tra cứu: {e}")
+
+
+async def handle_customer_search(update: Update, query_kh: str):
+    """Tìm kiếm hàng loạt container/booking theo Tên Khách Hàng (Cột 10 trên TMS XUẤT - ALL)"""
+    if len(query_kh) < 2:
+        await update.message.reply_text(
+            "⚠️ Từ khóa tên khách hàng cần ít nhất 2 ký tự.\n"
+            "👉 Ví dụ: `KH: Tiền` hoặc `KH: Phong` hoặc `/kh Cty Tiền Phong`",
+            parse_mode="Markdown"
+        )
+        return
+
+    wait_msg = await update.message.reply_text(
+        f"🔍 Đang tìm kiếm các container của khách hàng **'{query_kh}'** trên tab XUẤT - ALL của TMS..."
+    )
+    try:
+        if not tms_api.is_logged_in:
+            await tms_api.login()
+
+        results = await tms_api.find_containers_by_customer(query_kh)
+        if not results:
+            await wait_msg.edit_text(
+                f"❌ Không tìm thấy container/booking nào của khách hàng khớp với **'{query_kh}'** trong phạm vi 7 ngày gần đây.\n\n"
+                f"💡 **Gợi ý:**\n"
+                f"• Thử từ khóa ngắn hơn, ví dụ: `KH: Tiền` hoặc `KH: Phong`.\n"
+                f"• Kiểm tra gõ `/status` để xem TMS có đang kết nối bình thường không.\n"
+                f"• Hoặc tra cứu trực tiếp theo Số Cont hoặc Mã Booking.",
+                parse_mode="Markdown"
+            )
+            return
+
+        total = len(results)
+        summary_lines = []
+        for i, r in enumerate(results, start=1):
+            cont = r.get("so_cont") or "Chưa có cont"
+            booking = r.get("booking_id") or "N/A"
+            tau = r.get("tau") or "Chưa rõ tàu"
+            chuyen = r.get("chuyen") or ""
+            tau_str = f"{tau} ({chuyen})" if chuyen else tau
+            pod = r.get("pod_cot_14") or "Chưa gán POD"
+            khach = r.get("khach_hang") or "Chưa có tên"
+            ngay = r.get("ngay_dong") or r.get("date_queried") or ""
+            xe = r.get("so_xe") or "Chưa gán xe"
+
+            line = (
+                f"{i}. 📦 Cont: `{cont}` | 🔖 `{booking}` | ⚓ POD: `{pod}`\n"
+                f"   📅 `{ngay}` | 🚢 {tau_str} | 🚚 `{xe}`\n"
+                f"   🏢 _{khach}_"
+            )
+            summary_lines.append(line)
+
+        # Hiển thị tối đa 12 dòng tóm tắt trong tin nhắn tổng quan
+        summary_text = "\n".join(summary_lines[:12])
+        if total > 12:
+            summary_text += f"\n... và còn {total - 12} container khác."
+
+        await wait_msg.edit_text(
+            f"🏢 **TÌM THẤY {total} CONTAINER THEO KHÁCH HÀNG: '{query_kh.upper()}'**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{summary_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 *Dưới đây là chi tiết từng container. Bấm nút để chỉnh sửa và submit ngược lên TMS:*",
+            parse_mode="Markdown"
+        )
+
+        # Gửi thẻ chi tiết kèm hàng nút bấm tương tác (hiển thị tối đa 8 container)
+        max_cards = min(8, total)
+        for r in results[:max_cards]:
+            card_text = build_container_card(r)
+            kb = build_container_keyboard(r.get("row_id", ""), r.get("row_timestamp", ""))
+            await update.message.reply_text(card_text, reply_markup=kb, parse_mode="Markdown")
+            await asyncio.sleep(0.15)  # Tránh spam rate limit của Telegram
+
+        if total > max_cards:
+            await update.message.reply_text(
+                f"ℹ️ *Đã hiển thị {max_cards}/{total} thẻ chi tiết gần nhất.* Để chỉnh sửa các cont còn lại, bạn có thể gõ trực tiếp số cont hoặc mã booking đó.",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.exception(f"Lỗi tìm kiếm theo khách hàng: {e}")
+        await wait_msg.edit_text(f"❌ Đã xảy ra lỗi khi tìm kiếm: {e}")
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,13 +445,25 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.edit_text(f"❌ Cập nhật thất bại. Vui lòng thử lại sau.")
         return
 
-    # 2. Nếu là 1 chuỗi ngắn (Số cont hoặc Booking đơn lẻ trên 1 dòng) ➔ Tra cứu nhanh
+    # 2. Kiểm tra cú pháp tìm kiếm theo Tên Khách Hàng (VD: KH: Tiền, KH: Phong, KH: "Cty Tiền Phong MN")
+    if "\n" not in text:
+        m_kh = re.match(
+            r"^(?:(?:TÌM|TIM)\s+)?(?:KH|KHACH|KHÁCH|KHACH HANG|KHÁCH HÀNG)\s*[:：\s]\s*(.+)$",
+            text,
+            re.IGNORECASE,
+        )
+        if m_kh:
+            query_kh = m_kh.group(1).strip().strip('"').strip("'").strip()
+            await handle_customer_search(update, query_kh)
+            return
+
+    # 3. Nếu là 1 chuỗi ngắn (Số cont hoặc Booking đơn lẻ trên 1 dòng) ➔ Tra cứu nhanh
     clean_text = text.replace(" ", "").upper()
     if len(clean_text) <= 15 and "\n" not in text:
         await handle_query_search(update, text)
         return
 
-    # 3. Nhận diện nếu là Email kế hoạch đóng hàng / trả hàng
+    # 4. Nhận diện nếu là Email kế hoạch đóng hàng / trả hàng
     email_keywords = ["BOOKING", "ĐÓNG HÀNG", "TRẢ HÀNG", "CHUYẾN", "TÀU", "KH ĐÓNG HÀNG", "KH TRẢ HÀNG", "SẢN LƯỢNG", "KẾ HOẠCH"]
     has_keywords = any(k in text.upper() for k in email_keywords)
     has_structure = "---" in text or "CHI TIẾT" in text.upper() or "\t" in text or "|" in text or len(text.splitlines()) >= 3
@@ -464,6 +582,7 @@ def create_telegram_app() -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("tim", tim_cmd))
+    app.add_handler(CommandHandler("kh", kh_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

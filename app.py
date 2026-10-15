@@ -190,7 +190,10 @@ async def handle_query_search(update: Update, query: str):
         if not results:
             await wait_msg.edit_text(
                 f"❌ Không tìm thấy thông tin nào khớp với `{query}` trong phạm vi [-2 đến +5 ngày].\n\n"
-                f"💡 Bạn có thể kiểm tra lại số cont hoặc mã booking.",
+                f"💡 **Gợi ý kiểm tra:**\n"
+                f"1. Gõ `/status` để xem bot có đang kết nối TMS bình thường và xem số cont hôm nay.\n"
+                f"2. Kiểm tra lại số cont hoặc mã booking.\n"
+                f"3. Dán email kế hoạch đóng hàng vào để bot tự động tạo dòng mới.",
                 parse_mode="Markdown"
             )
             return
@@ -425,6 +428,13 @@ def create_telegram_app() -> Application:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Khởi động FastAPI server...")
+    # Khởi động và đăng nhập TMS trước
+    try:
+        await tms_api.login()
+        logger.info("✅ Đã kết nối và đăng nhập sẵn sàng vào VSHO TMS tab XUẤT - ALL!")
+    except Exception as e:
+        logger.warning(f"⚠️ Chưa thể đăng nhập TMS lúc khởi động (sẽ tự thử lại khi có yêu cầu): {e}")
+
     if config.TELEGRAM_BOT_TOKEN:
         tg = create_telegram_app()
         if tg:
@@ -437,6 +447,7 @@ async def lifespan(app: FastAPI):
                 logger.info("Chạy ở chế độ Polling...")
                 await tg.start()
                 await tg.updater.start_polling()
+
     yield
     if tg_app:
         logger.info("Dừng bot Telegram...")

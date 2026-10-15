@@ -43,7 +43,7 @@ class TMSExportApiClient:
         return self.client
 
     async def login(self) -> bool:
-        """Đăng nhập hệ thống Vietsun TMS và chuyển sang chế độ XUẤT - ALL (kieuXemTrucking = 2)"""
+        """Đăng nhập hệ thống Vietsun TMS (qua login2.html / 0login.php) và tự điều hướng sang tab XUẤT - ALL (kieuXemTrucking = 2)"""
         async with self._login_lock:
             client = await self.get_client()
             login_url = f"{config.TMS_URL}/0login.php"
@@ -53,23 +53,32 @@ class TMSExportApiClient:
                 "login": "ĐĂNG NHẬP"
             }
             try:
+                # 1. Truy cập trang đăng nhập login2.html để thiết lập cookie phiên
+                try:
+                    await client.get(f"{config.TMS_URL}/login2.html")
+                except Exception as e_get:
+                    logger.debug(f"Mở login2.html: {e_get}")
+
+                # 2. Gửi thông tin đăng nhập lên 0login.php
                 logger.info("Đang đăng nhập vào VSHO Vietsun TMS...")
                 resp = await client.post(login_url, data=login_payload)
+                resp_text = resp.content.decode("utf-8", errors="replace")
                 self.last_login_debug = {
                     "status": resp.status_code,
-                    "len": len(resp.text),
-                    "sample": resp.text[:80].replace("\n", " ").strip(),
+                    "len": len(resp_text),
+                    "sample": resp_text[:80].replace("\n", " ").strip(),
                     "err": None,
                 }
 
-                # Tìm userString trong nội dung phản hồi 0login.php
-                m = re.search(r'id="userString"\s+value="([^"]+)"', resp.text)
+                # 3. Lấy mã userString từ nội dung phản hồi hoặc trang index-home.php
+                m = re.search(r'id="userString"\s+value="([^"]+)"', resp_text)
                 if not m:
                     # Nếu redirect 302 chưa nạp HTML, chủ động GET index-home.php
                     home_resp = await client.get(f"{config.TMS_URL}/index-home.php")
-                    m = re.search(r'id="userString"\s+value="([^"]+)"', home_resp.text)
+                    home_text = home_resp.content.decode("utf-8", errors="replace")
+                    m = re.search(r'id="userString"\s+value="([^"]+)"', home_text)
                     self.last_login_debug["home_status"] = home_resp.status_code
-                    self.last_login_debug["home_len"] = len(home_resp.text)
+                    self.last_login_debug["home_len"] = len(home_text)
 
                 if m:
                     self.user_string = m.group(1)
@@ -77,7 +86,8 @@ class TMSExportApiClient:
                     self.last_login_debug["user_string"] = self.user_string
                     logger.info(f"Đăng nhập thành công! userString = {self.user_string}")
 
-                    # Chuyển tab hiển thị sang XUẤT - ALL (giá trị 2)
+                    # 4. TỰ ĐIỀU HƯỚNG VỀ TAB 'XUẤT - ALL':
+                    # Gán kieuXemTrucking = 2 (XUẤT - ALL) lên hệ thống
                     await self.ensure_export_view()
                     return True
                 else:
@@ -90,6 +100,7 @@ class TMSExportApiClient:
                 self.last_login_debug = {"err": str(e)}
                 logger.exception(f"Lỗi khi gửi request đăng nhập: {e}")
                 return False
+
 
 
     async def ensure_export_view(self) -> bool:
@@ -293,34 +304,35 @@ class TMSExportApiClient:
 
         try:
             resp = await client.post(ajax_url, data=payload)
+            html_text = resp.content.decode("utf-8", errors="replace")
+
             self.last_fetch_debug = {
                 "status": resp.status_code,
-                "size": len(resp.text),
-                "sample": resp.text[:120].replace("\n", " ").strip(),
+                "size": len(html_text),
+                "sample": html_text[:120].replace("\n", " ").strip(),
                 "err": None,
             }
 
             # Kiểm tra xem có bị lỗi phiên / lỗi đăng nhập hay không
             is_session_error = (
-                "login2.html" in resp.text
-                or "lỗi đăng nhập" in resp.text.lower()
-                or "dang nhap" in resp.text.lower()
+                "login2.html" in html_text
+                or "lỗi đăng nhập" in html_text.lower()
+                or "dang nhap" in html_text.lower()
                 or resp.status_code != 200
-                or len(resp.text) < 500
+                or len(html_text) < 500
             )
 
             if is_session_error:
-                logger.info(f"Phát hiện phản hồi không hợp lệ ({resp.text[:50]}), đang đăng nhập lại...")
+                logger.info(f"Phát hiện phản hồi không hợp lệ ({html_text[:50]}), đang đăng nhập lại...")
                 login_ok = await self.login()
                 if login_ok:
                     payload["userString"] = self.user_string
                     resp = await client.post(ajax_url, data=payload)
+                    html_text = resp.content.decode("utf-8", errors="replace")
                     self.last_fetch_debug["status_retry"] = resp.status_code
-                    self.last_fetch_debug["size_retry"] = len(resp.text)
-                    self.last_fetch_debug["sample"] = resp.text[:120].replace("\n", " ").strip()
+                    self.last_fetch_debug["size_retry"] = len(html_text)
+                    self.last_fetch_debug["sample"] = html_text[:120].replace("\n", " ").strip()
 
-            resp.encoding = "utf-8"
-            html_text = resp.text
 
             # TỐI ƯU SIÊU TỐC: Nếu đang tìm kiếm 1 cont/booking cụ thể
             if target_query:

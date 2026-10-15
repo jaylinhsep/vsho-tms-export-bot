@@ -145,23 +145,44 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t0 = time.time()
         ok = await tms_api.login()
         if not ok:
-            await wait_msg.edit_text("❌ Đăng nhập thất bại, vui lòng kiểm tra tài khoản/mật khẩu TMS.")
+            dbg_login = getattr(tms_api, "last_login_debug", {})
+            err_detail = dbg_login.get("err", "Không rõ nguyên nhân")
+            await wait_msg.edit_text(f"❌ Đăng nhập TMS thất bại: `{err_detail}`\nVui lòng kiểm tra tài khoản/mật khẩu TMS.")
             return
 
         from datetime import datetime
         today_str = datetime.now(tms_api.VN_TZ if hasattr(tms_api, "VN_TZ") else None).strftime("%Y-%m-%d") if hasattr(tms_api, "VN_TZ") else datetime.now().strftime("%Y-%m-%d")
         rows = await tms_api.fetch_table_for_date(today_str, force_refresh=True)
         elapsed = round(time.time() - t0, 2)
+        dbg = getattr(tms_api, "last_fetch_debug", {})
 
-        await wait_msg.edit_text(
-            f"✅ **Hệ thống VSHO TMS Hoạt Động Bình Thường!**\n\n"
-            f"👤 Tài khoản: `{config.TMS_USERNAME}`\n"
-            f"📊 Tab đang kết nối: **XUẤT - ALL** (kieuXemTrucking=2)\n"
-            f"📦 Số lượng cont xuất hôm nay ({today_str}): `{len(rows)}` cont\n"
-            f"⚡ Tốc độ phản hồi: `{elapsed}s`\n"
-            f"🔑 Gemini AI: `{'Đã cấu hình' if config.GEMINI_API_KEY else 'Chưa có key (dùng regex)'}`",
-            parse_mode="Markdown",
-        )
+        if len(rows) > 0:
+            await wait_msg.edit_text(
+                f"✅ **Hệ thống VSHO TMS Hoạt Động Bình Thường!**\n\n"
+                f"👤 Tài khoản: `{config.TMS_USERNAME}`\n"
+                f"📊 Tab đang kết nối: **XUẤT - ALL** (kieuXemTrucking=2)\n"
+                f"📦 Số lượng cont xuất hôm nay ({today_str}): **{len(rows)}** cont\n"
+                f"⚡ Tốc độ phản hồi: `{elapsed}s`\n"
+                f"🔑 Gemini AI: `{'Đã cấu hình' if config.GEMINI_API_KEY else 'Chưa có key (dùng regex)'}`",
+                parse_mode="Markdown",
+            )
+        else:
+            sample_txt = dbg.get("sample", "Trống")
+            err_txt = dbg.get("err", "Không có exception")
+            size_txt = dbg.get("size", 0)
+            status_http = dbg.get("status", "N/A")
+            await wait_msg.edit_text(
+                f"⚠️ **Đã kết nối TMS nhưng nhận được 0 container:**\n\n"
+                f"👤 Tài khoản: `{config.TMS_USERNAME}`\n"
+                f"📅 Ngày kiểm tra: `{today_str}`\n"
+                f"⚡ Tốc độ: `{elapsed}s`\n\n"
+                f"🔍 **Chi tiết kỹ thuật:**\n"
+                f"• HTTP Status: `{status_http}` | Dung lượng: `{size_txt} bytes`\n"
+                f"• Nội dung phản hồi: `{sample_txt}`\n"
+                f"• Lỗi: `{err_txt}`\n\n"
+                f"💡 Gợi ý: Hãy thử tra cứu 1 số cont cụ thể (VD: `DRYU9591226` hoặc `VSGU4254030`).",
+                parse_mode="Markdown",
+            )
     except Exception as e:
         logger.exception("Lỗi status")
         await wait_msg.edit_text(f"❌ Lỗi kiểm tra kết nối: {e}")

@@ -28,6 +28,8 @@ class TMSExportApiClient:
         self.cache_time: Dict[str, float] = {}
         self.CACHE_TTL: float = 90.0
         self._login_lock = asyncio.Lock()
+        self.last_fetch_debug: Dict[str, Any] = {}
+        self.last_login_debug: Dict[str, Any] = {}
 
     async def get_client(self) -> httpx.AsyncClient:
         if self.client is None or self.client.is_closed:
@@ -53,22 +55,42 @@ class TMSExportApiClient:
             try:
                 logger.info("Đang đăng nhập vào VSHO Vietsun TMS...")
                 resp = await client.post(login_url, data=login_payload)
-                if resp.status_code == 200:
-                    m = re.search(r'id="userString"\s+value="([^"]+)"', resp.text)
-                    if m:
-                        self.user_string = m.group(1)
+                self.last_login_debug = {
+                    "status": resp.status_code,
+                    "len": len(resp.text),
+                    "sample": resp.text[:80].replace("\n", " ").strip(),
+                    "err": None,
+                }
+
+                # Tìm userString trong nội dung phản hồi 0login.php
+                m = re.search(r'id="userString"\s+value="([^"]+)"', resp.text)
+                if not m:
+                    # Nếu redirect 302 chưa nạp HTML, chủ động GET index-home.php
+                    home_resp = await client.get(f"{config.TMS_URL}/index-home.php")
+                    m = re.search(r'id="userString"\s+value="([^"]+)"', home_resp.text)
+                    self.last_login_debug["home_status"] = home_resp.status_code
+                    self.last_login_debug["home_len"] = len(home_resp.text)
+
+                if m:
+                    self.user_string = m.group(1)
                     self.is_logged_in = True
+                    self.last_login_debug["user_string"] = self.user_string
                     logger.info(f"Đăng nhập thành công! userString = {self.user_string}")
 
                     # Chuyển tab hiển thị sang XUẤT - ALL (giá trị 2)
                     await self.ensure_export_view()
                     return True
                 else:
-                    logger.error(f"Đăng nhập thất bại: HTTP {resp.status_code}")
+                    self.is_logged_in = False
+                    self.last_login_debug["err"] = f"Không tìm thấy userString trong HTML (HTTP {resp.status_code})"
+                    logger.error(self.last_login_debug["err"])
                     return False
             except Exception as e:
+                self.is_logged_in = False
+                self.last_login_debug = {"err": str(e)}
                 logger.exception(f"Lỗi khi gửi request đăng nhập: {e}")
                 return False
+
 
     async def ensure_export_view(self) -> bool:
         """Đảm bảo thiết lập kieuXemTrucking = 2 (XUẤT - ALL)"""
@@ -271,11 +293,31 @@ class TMSExportApiClient:
 
         try:
             resp = await client.post(ajax_url, data=payload)
-            if "login2.html" in resp.text or resp.status_code != 200:
-                logger.info("Phiên đăng nhập hết hạn hoặc chưa đăng nhập, đang login lại...")
-                await self.login()
-                payload["userString"] = self.user_string
-                resp = await client.post(ajax_url, data=payload)
+            self.last_fetch_debug = {
+                "status": resp.status_code,
+                "size": len(resp.text),
+                "sample": resp.text[:120].replace("\n", " ").strip(),
+                "err": None,
+            }
+
+            # Kiểm tra xem có bị lỗi phiên / lỗi đăng nhập hay không
+            is_session_error = (
+                "login2.html" in resp.text
+                or "lỗi đăng nhập" in resp.text.lower()
+                or "dang nhap" in resp.text.lower()
+                or resp.status_code != 200
+                or len(resp.text) < 500
+            )
+
+            if is_session_error:
+                logger.info(f"Phát hiện phản hồi không hợp lệ ({resp.text[:50]}), đang đăng nhập lại...")
+                login_ok = await self.login()
+                if login_ok:
+                    payload["userString"] = self.user_string
+                    resp = await client.post(ajax_url, data=payload)
+                    self.last_fetch_debug["status_retry"] = resp.status_code
+                    self.last_fetch_debug["size_retry"] = len(resp.text)
+                    self.last_fetch_debug["sample"] = resp.text[:120].replace("\n", " ").strip()
 
             resp.encoding = "utf-8"
             html_text = resp.text
@@ -307,8 +349,10 @@ class TMSExportApiClient:
 
             return rows
         except Exception as e:
+            self.last_fetch_debug = {"err": str(e)}
             logger.warning(f"Lỗi khi tải bảng XUẤT - ALL cho ngày {date_str}: {e}")
             return []
+
 
     async def find_container_or_booking(self, query: str) -> List[Dict[str, Any]]:
         """

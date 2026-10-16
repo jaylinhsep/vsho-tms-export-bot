@@ -257,58 +257,80 @@ async def xoa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_query_search(update: Update, query: str):
-    """Tìm kiếm và hiển thị thẻ thông tin container xuất kèm nút chỉnh sửa"""
+    """Tìm kiếm thông minh: tra cứu số cont/booking trước, nếu không có tự động tìm theo Tên Khách Hàng"""
     wait_msg = await update.message.reply_text(f"🔍 Đang tra cứu `{query}` trên tab XUẤT - ALL của TMS...")
     try:
         if not tms_api.is_logged_in:
             await tms_api.login()
 
+        # BƯỚC 1: Tìm kiếm theo số container hoặc mã booking
         results = await tms_api.find_container_or_booking(query)
-        if not results:
-            await wait_msg.edit_text(
-                f"❌ Không tìm thấy thông tin nào khớp với `{query}` trong phạm vi [-2 đến +5 ngày].\n\n"
-                f"💡 **Gợi ý kiểm tra:**\n"
-                f"1. Gõ `/status` để xem bot có đang kết nối TMS bình thường và xem số cont hôm nay.\n"
-                f"2. Kiểm tra lại số cont hoặc mã booking.\n"
-                f"3. Dán email kế hoạch đóng hàng vào để bot tự động tạo dòng mới.",
-                parse_mode="Markdown"
-            )
+        if results:
+            await wait_msg.delete()
+            for r in results[:4]:  # Hiển thị tối đa 4 kết quả khớp nhất
+                card_text = build_container_card(r)
+                kb = build_container_keyboard(r.get("row_id", ""), r.get("row_timestamp", ""))
+                await update.message.reply_text(card_text, reply_markup=kb, parse_mode="Markdown")
             return
 
-        await wait_msg.delete()
-        for r in results[:4]:  # Hiển thị tối đa 4 kết quả khớp nhất
-            card_text = build_container_card(r)
-            kb = build_container_keyboard(r.get("row_id", ""), r.get("row_timestamp", ""))
-            await update.message.reply_text(card_text, reply_markup=kb, parse_mode="Markdown")
+        # BƯỚC 2 (TỰ ĐỘNG THÔNG MINH): Nếu không thấy cont/booking, tự động tìm kiếm theo TÊN KHÁCH HÀNG!
+        logger.info(f"Không tìm thấy cont/booking '{query}', tự động chuyển sang tìm theo Khách hàng...")
+        results_kh = await tms_api.find_containers_by_customer(query)
+        if results_kh:
+            await handle_customer_search(update, query, wait_msg=wait_msg, preloaded_results=results_kh)
+            return
+
+        # BƯỚC 3: Nếu cả 2 đều không tìm thấy
+        await wait_msg.edit_text(
+            f"❌ Không tìm thấy thông tin nào khớp với `{query}` trong phạm vi [-3 đến +5 ngày].\n\n"
+            f"💡 **Gợi ý kiểm tra:**\n"
+            f"1. Gõ `/status` để xem bot có đang kết nối TMS bình thường và xem số cont hôm nay.\n"
+            f"2. Kiểm tra lại từ khóa (VD: `liwayway`, `Tiền`, số cont hoặc mã booking).\n"
+            f"3. Dán email kế hoạch đóng hàng vào để bot tự động tạo dòng mới.",
+            parse_mode="Markdown"
+        )
 
     except Exception as e:
         logger.exception(f"Lỗi khi tra cứu: {e}")
         await wait_msg.edit_text(f"❌ Đã xảy ra lỗi khi tra cứu: {e}")
 
 
-async def handle_customer_search(update: Update, query_kh: str):
+async def handle_customer_search(
+    update: Update,
+    query_kh: str,
+    wait_msg=None,
+    preloaded_results: Optional[list] = None
+):
     """Tìm kiếm hàng loạt container/booking theo Tên Khách Hàng (Cột 10 trên TMS XUẤT - ALL)"""
     if len(query_kh) < 2:
-        await update.message.reply_text(
-            "⚠️ Từ khóa tên khách hàng cần ít nhất 2 ký tự.\n"
-            "👉 Ví dụ: `KH: Tiền` hoặc `KH: Phong` hoặc `/kh Cty Tiền Phong`",
-            parse_mode="Markdown"
-        )
+        if wait_msg:
+            await wait_msg.edit_text("⚠️ Từ khóa tên khách hàng cần ít nhất 2 ký tự (Ví dụ: `KH: Tiền` hoặc `liwayway`).", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "⚠️ Từ khóa tên khách hàng cần ít nhất 2 ký tự.\n"
+                "👉 Ví dụ: `KH: Tiền` hoặc `KH: Phong` hoặc `liwayway`",
+                parse_mode="Markdown"
+            )
         return
 
-    wait_msg = await update.message.reply_text(
-        f"🔍 Đang tìm kiếm các container của khách hàng **'{query_kh}'** trên tab XUẤT - ALL của TMS..."
-    )
+    if not wait_msg:
+        wait_msg = await update.message.reply_text(
+            f"🔍 Đang tìm kiếm các container của khách hàng **'{query_kh}'** trên tab XUẤT - ALL của TMS..."
+        )
     try:
         if not tms_api.is_logged_in:
             await tms_api.login()
 
-        results = await tms_api.find_containers_by_customer(query_kh)
+        if preloaded_results is not None:
+            results = preloaded_results
+        else:
+            results = await tms_api.find_containers_by_customer(query_kh)
+
         if not results:
             await wait_msg.edit_text(
                 f"❌ Không tìm thấy container/booking nào của khách hàng khớp với **'{query_kh}'** trong phạm vi 7 ngày gần đây.\n\n"
                 f"💡 **Gợi ý:**\n"
-                f"• Thử từ khóa ngắn hơn, ví dụ: `KH: Tiền` hoặc `KH: Phong`.\n"
+                f"• Thử từ khóa ngắn hơn, ví dụ: `liwayway`, `Tiền` hoặc `Phong`.\n"
                 f"• Kiểm tra gõ `/status` để xem TMS có đang kết nối bình thường không.\n"
                 f"• Hoặc tra cứu trực tiếp theo Số Cont hoặc Mã Booking.",
                 parse_mode="Markdown"

@@ -448,8 +448,8 @@ class TMSExportApiClient:
             await self.login()
 
         today = datetime.now(VN_TZ)
-        # Quét hôm nay trước, sau đó là các ngày lân cận (tương lai gần và quá khứ gần)
-        offsets = [0, 1, 2, 3, 4, -1, -2]
+        # Quét hôm nay trước, sau đó là các ngày lân cận (tương lai và quá khứ gần: -3 đến +5 ngày)
+        offsets = [0, 1, 2, 3, 4, 5, -1, -2, -3]
 
         all_matched: List[Dict[str, Any]] = []
         seen_row_ids: Set[str] = set()

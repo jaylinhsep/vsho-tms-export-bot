@@ -81,6 +81,7 @@ def build_container_card(r: Dict[str, Any]) -> str:
         f"• **Tàu / Chuyến:** {tau} ({chuyen})\n"
         f"• **Ngày đóng:** `{ngay_dong}` | **Ngày tàu chạy:** `{ngay_chay}`\n"
         f"• **Khách hàng:** {khach}\n"
+        f"• **Hàng hóa:** {r.get('ten_hang') or 'Chưa rõ'}\n"
         f"• **Kho đóng:** {kho} {f'({tinh})' if tinh else ''}\n"
         f"• **Sản lượng:** {sl_str} {f'| **GW:** {gw}T' if gw else ''}\n"
         f"• **Số Cont:** `{cont}`\n"
@@ -257,38 +258,37 @@ async def xoa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_query_search(update: Update, query: str):
-    """Tìm kiếm thông minh: tra cứu số cont/booking trước, nếu không có tự động tìm theo Tên Khách Hàng"""
+    """Tìm kiếm thông minh đa năng: số cont, mã booking, tên khách hàng, tên hàng hóa (Gạo, Bia...), số xe, POD..."""
     wait_msg = await update.message.reply_text(f"🔍 Đang tra cứu `{query}` trên tab XUẤT - ALL của TMS...")
     try:
         if not tms_api.is_logged_in:
             await tms_api.login()
 
-        # BƯỚC 1: Tìm kiếm theo số container hoặc mã booking
-        results = await tms_api.find_container_or_booking(query)
-        if results:
+        results = await tms_api.search_containers(query)
+        if not results:
+            await wait_msg.edit_text(
+                f"❌ Không tìm thấy container/booking nào khớp với **'{query}'** trong phạm vi 7 ngày gần đây.\n\n"
+                f"💡 **Gợi ý tra cứu linh hoạt:**\n"
+                f"• **Số Cont / Mã Booking:** VD `GAOU2111920`, `300170`\n"
+                f"• **Tên Khách Hàng:** VD `Liwayway`, `liwayway`, `Tiền`, `Phong`\n"
+                f"• **Hàng Hóa / Cont Gạo:** VD `Gạo`, `gao`, `GAO`, `Bia`, `Sữa`\n"
+                f"• **Số Xe / Cảng POD:** VD `50H`, `61H`, `CLO`, `HPH`\n"
+                f"• Hoặc gõ `/status` để kiểm tra kết nối TMS.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Nếu chỉ có duy nhất 1 container khớp chính xác
+        if len(results) == 1:
             await wait_msg.delete()
-            for r in results[:4]:  # Hiển thị tối đa 4 kết quả khớp nhất
-                card_text = build_container_card(r)
-                kb = build_container_keyboard(r.get("row_id", ""), r.get("row_timestamp", ""))
-                await update.message.reply_text(card_text, reply_markup=kb, parse_mode="Markdown")
+            r = results[0]
+            card_text = build_container_card(r)
+            kb = build_container_keyboard(r.get("row_id", ""), r.get("row_timestamp", ""))
+            await update.message.reply_text(card_text, reply_markup=kb, parse_mode="Markdown")
             return
 
-        # BƯỚC 2 (TỰ ĐỘNG THÔNG MINH): Nếu không thấy cont/booking, tự động tìm kiếm theo TÊN KHÁCH HÀNG!
-        logger.info(f"Không tìm thấy cont/booking '{query}', tự động chuyển sang tìm theo Khách hàng...")
-        results_kh = await tms_api.find_containers_by_customer(query)
-        if results_kh:
-            await handle_customer_search(update, query, wait_msg=wait_msg, preloaded_results=results_kh)
-            return
-
-        # BƯỚC 3: Nếu cả 2 đều không tìm thấy
-        await wait_msg.edit_text(
-            f"❌ Không tìm thấy thông tin nào khớp với `{query}` trong phạm vi [-3 đến +5 ngày].\n\n"
-            f"💡 **Gợi ý kiểm tra:**\n"
-            f"1. Gõ `/status` để xem bot có đang kết nối TMS bình thường và xem số cont hôm nay.\n"
-            f"2. Kiểm tra lại từ khóa (VD: `liwayway`, `Tiền`, số cont hoặc mã booking).\n"
-            f"3. Dán email kế hoạch đóng hàng vào để bot tự động tạo dòng mới.",
-            parse_mode="Markdown"
-        )
+        # Nếu có từ 2 container trở lên -> Hiển thị danh sách tổng quan + các thẻ chi tiết
+        await handle_customer_search(update, query, wait_msg=wait_msg, preloaded_results=results)
 
     except Exception as e:
         logger.exception(f"Lỗi khi tra cứu: {e}")
@@ -301,21 +301,22 @@ async def handle_customer_search(
     wait_msg=None,
     preloaded_results: Optional[list] = None
 ):
-    """Tìm kiếm hàng loạt container/booking theo Tên Khách Hàng (Cột 10 trên TMS XUẤT - ALL)"""
-    if len(query_kh) < 2:
+    """Tìm kiếm và hiển thị danh sách container theo từ khóa (Khách hàng, Hàng hóa, Cảng, Cont...)"""
+    clean_q = query_kh.strip().strip('"').strip("'").strip()
+    if len(clean_q) < 2:
         if wait_msg:
-            await wait_msg.edit_text("⚠️ Từ khóa tên khách hàng cần ít nhất 2 ký tự (Ví dụ: `KH: Tiền` hoặc `liwayway`).", parse_mode="Markdown")
+            await wait_msg.edit_text("⚠️ Từ khóa tìm kiếm cần ít nhất 2 ký tự (Ví dụ: `Gạo`, `Liwayway`, `Tiền`, `Phong`).", parse_mode="Markdown")
         else:
             await update.message.reply_text(
-                "⚠️ Từ khóa tên khách hàng cần ít nhất 2 ký tự.\n"
-                "👉 Ví dụ: `KH: Tiền` hoặc `KH: Phong` hoặc `liwayway`",
+                "⚠️ Từ khóa tìm kiếm cần ít nhất 2 ký tự.\n"
+                "👉 Ví dụ: `KH: Tiền`, `Gạo`, `liwayway` hoặc `GAOU`",
                 parse_mode="Markdown"
             )
         return
 
     if not wait_msg:
         wait_msg = await update.message.reply_text(
-            f"🔍 Đang tìm kiếm các container của khách hàng **'{query_kh}'** trên tab XUẤT - ALL của TMS..."
+            f"🔍 Đang tìm kiếm các container khớp với **'{clean_q}'** trên tab XUẤT - ALL của TMS..."
         )
     try:
         if not tms_api.is_logged_in:
@@ -324,13 +325,13 @@ async def handle_customer_search(
         if preloaded_results is not None:
             results = preloaded_results
         else:
-            results = await tms_api.find_containers_by_customer(query_kh)
+            results = await tms_api.search_containers(clean_q)
 
         if not results:
             await wait_msg.edit_text(
-                f"❌ Không tìm thấy container/booking nào của khách hàng khớp với **'{query_kh}'** trong phạm vi 7 ngày gần đây.\n\n"
+                f"❌ Không tìm thấy container nào khớp với **'{clean_q}'** trong phạm vi 7 ngày gần đây.\n\n"
                 f"💡 **Gợi ý:**\n"
-                f"• Thử từ khóa ngắn hơn, ví dụ: `liwayway`, `Tiền` hoặc `Phong`.\n"
+                f"• Thử từ khóa ngắn hơn: `liwayway`, `Gạo`, `gao`, `Tiền`, `Phong`.\n"
                 f"• Kiểm tra gõ `/status` để xem TMS có đang kết nối bình thường không.\n"
                 f"• Hoặc tra cứu trực tiếp theo Số Cont hoặc Mã Booking.",
                 parse_mode="Markdown"
@@ -347,13 +348,15 @@ async def handle_customer_search(
             tau_str = f"{tau} ({chuyen})" if chuyen else tau
             pod = r.get("pod_cot_14") or "Chưa gán POD"
             khach = r.get("khach_hang") or "Chưa có tên"
+            ten_hang = r.get("ten_hang") or ""
             ngay = r.get("ngay_dong") or r.get("date_queried") or ""
             xe = r.get("so_xe") or "Chưa gán xe"
 
+            hang_str = f" | 🌾 _{ten_hang}_" if ten_hang else ""
             line = (
                 f"{i}. 📦 Cont: `{cont}` | 🔖 `{booking}` | ⚓ POD: `{pod}`\n"
                 f"   📅 `{ngay}` | 🚢 {tau_str} | 🚚 `{xe}`\n"
-                f"   🏢 _{khach}_"
+                f"   🏢 _{khach}_{hang_str}"
             )
             summary_lines.append(line)
 
@@ -363,7 +366,7 @@ async def handle_customer_search(
             summary_text += f"\n... và còn {total - 12} container khác."
 
         await wait_msg.edit_text(
-            f"🏢 **TÌM THẤY {total} CONTAINER THEO KHÁCH HÀNG: '{query_kh.upper()}'**\n"
+            f"🔍 **TÌM THẤY {total} CONTAINER KHỚP VỚI: '{clean_q.upper()}'**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{summary_text}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -386,7 +389,7 @@ async def handle_customer_search(
             )
 
     except Exception as e:
-        logger.exception(f"Lỗi tìm kiếm theo khách hàng: {e}")
+        logger.exception(f"Lỗi tìm kiếm: {e}")
         await wait_msg.edit_text(f"❌ Đã xảy ra lỗi khi tìm kiếm: {e}")
 
 
@@ -561,9 +564,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_customer_search(update, query_kh)
             return
 
-    # 3. Nếu là 1 chuỗi ngắn (Số cont hoặc Booking đơn lẻ trên 1 dòng) ➔ Tra cứu nhanh
-    clean_text = text.replace(" ", "").upper()
-    if len(clean_text) <= 15 and "\n" not in text:
+    # 3. Nếu là văn bản 1 dòng (Số cont, Mã booking, Tên khách hàng, Hàng hóa, Xe...) ➔ Tra cứu đa năng
+    if "\n" not in text:
         await handle_query_search(update, text)
         return
 

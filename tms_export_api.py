@@ -15,14 +15,46 @@ logger = logging.getLogger(__name__)
 VN_TZ = timezone(timedelta(hours=7))
 
 
-def remove_accents(input_str: str) -> str:
-    """Loại bỏ dấu tiếng Việt và chuẩn hóa chữ thường để tìm kiếm tương đối (fuzzy search)"""
+def remove_accents(input_str: Any) -> str:
+    """Loại bỏ dấu tiếng Việt và chuẩn hóa chữ thường để tìm kiếm tương đối (fuzzy search) tuyệt đối chính xác"""
     if not input_str:
         return ""
-    # Thay thế chữ đ/Đ trước khi normalize NFKD
-    s = str(input_str).replace("đ", "d").replace("Đ", "D")
+    s = str(input_str)
+    # 1. Bảng thay thế trực tiếp toàn bộ nguyên âm/phụ âm tiếng Việt có dấu
+    char_map = {
+        "à": "a", "á": "a", "ả": "a", "ã": "a", "ạ": "a",
+        "ă": "a", "ằ": "a", "ắ": "a", "ẳ": "a", "ẵ": "a", "ặ": "a",
+        "â": "a", "ầ": "a", "ấ": "a", "ẩ": "a", "ẫ": "a", "ậ": "a",
+        "è": "e", "é": "e", "ẻ": "e", "ẽ": "e", "ẹ": "e",
+        "ê": "e", "ề": "e", "ế": "e", "ể": "e", "ễ": "e", "ệ": "e",
+        "ì": "i", "í": "i", "ỉ": "i", "ĩ": "i", "ị": "i",
+        "ò": "o", "ó": "o", "ỏ": "o", "õ": "o", "ọ": "o",
+        "ô": "o", "ồ": "o", "ố": "o", "ổ": "o", "ỗ": "o", "ộ": "o",
+        "ơ": "o", "ờ": "o", "ớ": "o", "ở": "o", "ỡ": "o", "ợ": "o",
+        "ù": "u", "ú": "u", "ủ": "u", "ũ": "u", "ụ": "u",
+        "ư": "u", "ừ": "u", "ứ": "u", "ử": "u", "ữ": "u", "ự": "u",
+        "ỳ": "y", "ý": "y", "ỷ": "y", "ỹ": "y", "ỵ": "y",
+        "đ": "d", "Đ": "D", "₫": "d",
+        "À": "A", "Á": "A", "Ả": "A", "Ã": "A", "Ạ": "A",
+        "Ă": "A", "Ằ": "A", "Ắ": "A", "Ẳ": "A", "Ẵ": "A", "Ặ": "A",
+        "Â": "A", "Ầ": "A", "Ấ": "A", "Ẩ": "A", "Ẫ": "A", "Ậ": "A",
+        "È": "E", "É": "E", "Ẻ": "E", "Ẽ": "E", "Ẹ": "E",
+        "Ê": "E", "Ề": "E", "Ế": "E", "Ể": "E", "Ễ": "E", "Ệ": "E",
+        "Ì": "I", "Í": "I", "Ỉ": "I", "Ĩ": "I", "Ị": "I",
+        "Ò": "O", "Ó": "O", "Ỏ": "O", "Õ": "O", "Ọ": "O",
+        "Ô": "O", "Ồ": "O", "Ố": "O", "Ổ": "O", "Ỗ": "O", "Ộ": "O",
+        "Ơ": "O", "Ờ": "O", "Ớ": "O", "Ở": "O", "Ỡ": "O", "Ợ": "O",
+        "Ù": "U", "Ú": "U", "Ủ": "U", "Ũ": "U", "Ụ": "U",
+        "Ư": "U", "Ừ": "U", "Ứ": "U", "Ử": "U", "Ữ": "U", "Ự": "U",
+        "Ỳ": "Y", "Ý": "Y", "Ỷ": "Y", "Ỹ": "Y", "Ỵ": "Y",
+    }
+    for k, v in char_map.items():
+        if k in s:
+            s = s.replace(k, v)
+    # 2. Chuẩn hóa thêm bằng NFKD để loại bỏ combining marks còn sót lại
     nfkd = unicodedata.normalize("NFKD", s)
-    return "".join([c for c in nfkd if not unicodedata.combining(c)]).strip().lower()
+    cleaned = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    return re.sub(r"\s+", " ", cleaned).strip().lower()
 
 class TMSExportApiClient:
     def __init__(self):
@@ -41,6 +73,7 @@ class TMSExportApiClient:
         self._login_lock = asyncio.Lock()
         self.last_fetch_debug: Dict[str, Any] = {}
         self.last_login_debug: Dict[str, Any] = {}
+        self.VN_TZ = VN_TZ
 
     async def get_client(self) -> httpx.AsyncClient:
         if self.client is None or self.client.is_closed:
@@ -292,11 +325,10 @@ class TMSExportApiClient:
     ) -> List[Dict[str, Any]]:
         """
         Lấy danh sách các dòng trong tab XUẤT - ALL của 1 ngày (YYYY-MM-DD).
-        Nếu có target_query, áp dụng bộ lọc substring tức thì (<0.1ms) trước khi parse HTML.
+        Luôn phân tích toàn bộ các dòng và lưu cache trong 90s để hỗ trợ tìm kiếm đa trường siêu tốc.
         """
         now = time.time()
-        # Nếu không có target_query cụ thể, kiểm tra RAM cache
-        if not force_refresh and not target_query and date_str in self.cache_date:
+        if not force_refresh and date_str in self.cache_date:
             if now - self.cache_time.get(date_str, 0) < self.CACHE_TTL:
                 return self.cache_date[date_str]
 
@@ -344,103 +376,114 @@ class TMSExportApiClient:
                     self.last_fetch_debug["size_retry"] = len(html_text)
                     self.last_fetch_debug["sample"] = html_text[:120].replace("\n", " ").strip()
 
-
-            # TỐI ƯU SIÊU TỐC: Nếu đang tìm kiếm 1 cont/booking cụ thể
-            if target_query:
-                clean_target = re.sub(r"\s+", "", target_query).upper()
-                if clean_target not in html_text:
-                    # Cont/booking không hề có trong ngày này, bỏ qua ngay trong 0.1ms!
-                    return []
-
             chunks = html_text.split('<tr id="tr')
             rows = []
             for chunk in chunks[1:]:
-                # Nếu có target_query, chỉ parse các chunk có chứa từ khóa đó
-                if target_query:
-                    clean_target = re.sub(r"\s+", "", target_query).upper()
-                    if clean_target not in chunk:
-                        continue
-
                 row_data = self._parse_row(f'<tr id="tr{chunk}', date_queried=date_str)
                 if row_data:
                     rows.append(row_data)
 
-            # Chỉ lưu cache ngày nếu là lượt quét đầy đủ
-            if not target_query:
-                self.cache_date[date_str] = rows
-                self.cache_time[date_str] = now
-
+            self.cache_date[date_str] = rows
+            self.cache_time[date_str] = now
             return rows
         except Exception as e:
             self.last_fetch_debug = {"err": str(e)}
             logger.warning(f"Lỗi khi tải bảng XUẤT - ALL cho ngày {date_str}: {e}")
             return []
 
-
-    async def find_container_or_booking(self, query: str) -> List[Dict[str, Any]]:
+    def row_matches_query(self, row: Dict[str, Any], clean_q: str, raw_q: str) -> Tuple[bool, int]:
         """
-        Tìm kiếm cont hoặc booking trong phạm vi [-2 đến +5] ngày tính từ hôm nay.
-        Chiến lược 2 pha siêu tốc:
-        - Pha 1: Quét ngày HÔM NAY trước tiên (95% dữ liệu thực tế). Phản hồi cực nhanh <0.5s.
-        - Pha 2: Nếu hôm nay không có, quét tuần tự các ngày lân cận (không dồn dập nhiều request).
+        Kiểm tra 1 dòng booking có khớp với từ khóa hay không.
+        Khớp đa trường (Đa năng): Cont, Booking, Khách hàng, Hàng hóa, Xe, Đơn vị VC, POD, Kho, Note.
+        Hoàn toàn KHÔNG phân biệt chữ HOA / chữ thường, KHÔNG phân biệt có dấu / không dấu.
+        Trả về (is_matched, match_score). Score càng cao thì kết quả càng khớp chính xác.
         """
-        clean_q = re.sub(r"\s+", "", str(query)).upper()
         if not clean_q:
-            return []
+            return False, 0
 
-        today = datetime.now(VN_TZ)
-        today_str = today.strftime("%Y-%m-%d")
+        score = 0
+        q_upper = raw_q.strip().upper()
+        q_no_space = clean_q.replace(" ", "")
 
-        # Đảm bảo đã đăng nhập
-        if not self.is_logged_in:
-            await self.login()
+        # 1. Số Container
+        raw_cont = row.get("so_cont", "")
+        clean_cont = remove_accents(raw_cont).replace(" ", "")
+        if raw_cont:
+            if clean_cont == q_no_space or raw_cont.upper() == q_upper:
+                return True, 100  # Khớp chính xác 100% số cont
+            if q_no_space in clean_cont:
+                score = max(score, 90)  # Khớp tiền tố hoặc chuỗi con cont (VD: GAO khớp GAOU2110158)
 
-        # PHA 1: Quét ngày HÔM NAY trước tiên
-        logger.info(f"🔍 [Pha 1] Tra cứu '{clean_q}' trong ngày hôm nay ({today_str})...")
-        today_rows = await self.fetch_table_for_date(today_str, target_query=clean_q)
-        matched = []
-        for r in today_rows:
-            cont = r.get("so_cont", "")
-            booking = r.get("booking_id", "")
-            row_id = r.get("row_id", "")
-            if (clean_q in cont) or (clean_q == booking) or (clean_q == row_id):
-                matched.append(r)
+        # 2. Mã Booking
+        raw_booking = str(row.get("booking_id", "")).strip()
+        if raw_booking:
+            if raw_booking.upper() == q_upper or clean_q == raw_booking.lower():
+                return True, 100  # Khớp chính xác mã booking
+            if q_no_space in raw_booking.lower():
+                score = max(score, 85)
 
-        if matched:
-            logger.info(f"✅ [Pha 1] Tìm thấy {len(matched)} kết quả ngay tại ngày hôm nay!")
-            return matched
+        # 3. ID PVT dòng
+        raw_id = str(row.get("row_id", "")).strip()
+        if raw_id and (raw_id == clean_q or raw_id == q_no_space):
+            return True, 100
 
-        # PHA 2: Quét các ngày lân cận (tương lai +1..+5, sau đó quá khứ -1..-2)
-        other_offsets = [1, 2, 3, 4, 5, -1, -2]
-        logger.info(f"🔍 [Pha 2] Không thấy trong hôm nay, tiếp tục quét các ngày lân cận cho '{clean_q}'...")
+        # 4. Tên Khách Hàng (Cột 10) & Chủ Hàng
+        kh = row.get("khach_hang", "")
+        clean_kh = remove_accents(kh)
+        if clean_q in clean_kh:
+            score = max(score, 80)
+        chu = row.get("chu_hang", "")
+        clean_chu = remove_accents(chu)
+        if clean_q in clean_chu:
+            score = max(score, 75)
 
-        for d_offset in other_offsets:
-            d_str = (today + timedelta(days=d_offset)).strftime("%Y-%m-%d")
-            day_rows = await self.fetch_table_for_date(d_str, target_query=clean_q)
-            for r in day_rows:
-                cont = r.get("so_cont", "")
-                booking = r.get("booking_id", "")
-                row_id = r.get("row_id", "")
-                if (clean_q in cont) or (clean_q == booking) or (clean_q == row_id):
-                    matched.append(r)
+        # 5. Tên Hàng Hóa (Cột 18: Gạo, Bánh kẹo, Sữa, Bia...)
+        ten_hang = row.get("ten_hang", "")
+        clean_hang = remove_accents(ten_hang)
+        if clean_q in clean_hang:
+            score = max(score, 70)
 
-            # Nếu đã tìm thấy, dừng ngay lập tức không cần quét tiếp các ngày sau
-            if matched:
-                logger.info(f"✅ [Pha 2] Tìm thấy {len(matched)} kết quả tại ngày {d_str}!")
-                return matched
+        # 6. Biển Số Xe (50H..., 61H...)
+        so_xe = row.get("so_xe", "")
+        clean_xe = remove_accents(so_xe).replace(" ", "")
+        if q_no_space and q_no_space in clean_xe:
+            score = max(score, 65)
 
-        logger.info(f"❌ Không tìm thấy kết quả nào cho '{clean_q}' trong phạm vi [-2 đến +5] ngày.")
-        return []
+        # 7. Đơn Vị Vận Chuyển (VSHO, Thái Hòa, Trucking 14...)
+        dvvc = row.get("don_vi_vc", "")
+        clean_dvvc = remove_accents(dvvc)
+        if clean_q in clean_dvvc:
+            score = max(score, 60)
 
-    async def find_containers_by_customer(self, customer_query: str) -> List[Dict[str, Any]]:
+        # 8. Cảng Đến POD Cột 14 (CLO, HPH, DNG, HCM...)
+        pod = row.get("pod_cot_14", "")
+        clean_pod = remove_accents(pod).replace(" ", "")
+        if q_no_space and q_no_space in clean_pod:
+            score = max(score, 55)
+
+        # 9. Địa Chỉ Kho Nhận Hàng / Kho Đóng (Tribeco, Sóng Thần...)
+        kho = row.get("kho_dong", "")
+        clean_kho = remove_accents(kho)
+        if clean_q in clean_kho:
+            score = max(score, 50)
+
+        # 10. Ghi Chú Đóng Hàng (noiDungPo)
+        ghi_chu = row.get("ghi_chu", "")
+        clean_note = remove_accents(ghi_chu)
+        if clean_q in clean_note:
+            score = max(score, 45)
+
+        return (score > 0), score
+
+    async def search_containers(self, query: str) -> List[Dict[str, Any]]:
         """
-        Tìm kiếm các container/booking theo Tên Khách Hàng (cột 10 trên TMS XUẤT - ALL).
-        Hỗ trợ tìm kiếm tương đối (không phân biệt hoa/thường, không phân biệt có dấu/không dấu tiếng Việt).
-        Ví dụ: 'Tiền', 'Phong', 'Tien', 'Cty Tiền Phong' đều khớp 'Cty Tiền Phong MN'.
-        Quét các ngày từ [hôm nay - 2 ngày] đến [hôm nay + 4 ngày].
+        Tìm kiếm ĐA NĂNG toàn diện trên tab XUẤT - ALL của TMS:
+        - Khớp Cont, Booking, Khách hàng, Tên hàng (Gạo, Bia...), Xe, Đơn vị VC, POD, Kho, Note.
+        - Tuyệt đối KHÔNG phân biệt chữ hoa / thường, có dấu / không dấu.
+        - Quét song song trong phạm vi 7 ngày gần nhất (-3 đến +3 ngày quanh hôm nay).
+        - Phản hồi siêu tốc, có cơ chế xếp hạng độ chính xác (Exact match đưa lên đầu).
         """
-        clean_q = remove_accents(customer_query)
-        clean_q = clean_q.strip('"').strip("'").strip()
+        clean_q = remove_accents(query).strip('"').strip("'").strip()
         if not clean_q or len(clean_q) < 2:
             return []
 
@@ -448,45 +491,61 @@ class TMSExportApiClient:
             await self.login()
 
         today = datetime.now(VN_TZ)
-        # Quét hôm nay trước, sau đó là các ngày lân cận (tương lai và quá khứ gần: -3 đến +5 ngày)
-        offsets = [0, 1, 2, 3, 4, 5, -1, -2, -3]
+        today_str = today.strftime("%Y-%m-%d")
 
-        all_matched: List[Dict[str, Any]] = []
+        # Quét ngày HÔM NAY trước tiên (ưu tiên cao nhất)
+        logger.info(f"🔍 Đang tìm kiếm đa năng '{query}' (chuẩn hóa: '{clean_q}') trên TMS...")
+        today_rows = await self.fetch_table_for_date(today_str, force_refresh=False)
+
+        # Danh sách các ngày lân cận (-3 đến +3 ngày)
+        other_offsets = [-1, -2, -3, 1, 2, 3]
+        other_dates = [(today + timedelta(days=off)).strftime("%Y-%m-%d") for off in other_offsets]
+
+        # Tải song song các ngày lân cận để tối ưu tốc độ phản hồi (<1.5s)
+        tasks = [self.fetch_table_for_date(d, force_refresh=False) for d in other_dates]
+        other_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_day_rows = list(today_rows)
+        for r_list in other_results:
+            if isinstance(r_list, list):
+                all_day_rows.extend(r_list)
+
+        matched_list: List[Tuple[Dict[str, Any], int]] = []
         seen_row_ids: Set[str] = set()
 
-        logger.info(f"🔍 Đang quét hàng loạt cont theo Tên Khách Hàng '{customer_query}' (chuẩn hóa: '{clean_q}')...")
+        for r in all_day_rows:
+            row_id = str(r.get("row_id", "")).strip()
+            if not row_id or row_id in seen_row_ids:
+                continue
 
-        for d_offset in offsets:
-            d_str = (today + timedelta(days=d_offset)).strftime("%Y-%m-%d")
-            # Tải danh sách các dòng của ngày này (tận dụng bộ nhớ đệm cache_date nếu có)
-            rows = await self.fetch_table_for_date(d_str, force_refresh=False)
-            for r in rows:
-                row_id = r.get("row_id", "")
-                if not row_id or row_id in seen_row_ids:
-                    continue
+            is_matched, score = self.row_matches_query(r, clean_q, query)
+            if is_matched:
+                seen_row_ids.add(row_id)
+                # Tăng nhẹ điểm ưu tiên nếu dòng thuộc về ngày hôm nay
+                if r.get("date_queried") == today_str or r.get("ngay_dong") == today.strftime("%d/%m/%Y"):
+                    score += 5
+                matched_list.append((r, score))
 
-                kh = r.get("khach_hang", "")
-                chu_hang = r.get("chu_hang", "")
-
-                clean_kh = remove_accents(kh)
-                clean_chu = remove_accents(chu_hang)
-
-                # Khớp tương đối: từ khóa người dùng gõ nằm trong tên khách hàng hoặc chủ hàng
-                if (clean_q in clean_kh) or (clean_q in clean_chu):
-                    seen_row_ids.add(row_id)
-                    all_matched.append(r)
-
-        # Sắp xếp kết quả: ngày gần hôm nay nhất và row_id mới nhất lên đầu
-        all_matched.sort(
-            key=lambda x: (
-                x.get("date_queried", ""),
-                int(x.get("row_id", 0)) if str(x.get("row_id", "")).isdigit() else 0
+        # Sắp xếp kết quả: Điểm khớp cao nhất lên đầu, sau đó theo ID mới nhất
+        matched_list.sort(
+            key=lambda item: (
+                item[1],  # Điểm khớp (score)
+                int(item[0].get("row_id", 0)) if str(item[0].get("row_id", "")).isdigit() else 0
             ),
             reverse=True
         )
 
-        logger.info(f"✅ Đã tìm thấy {len(all_matched)} container cho khách hàng '{customer_query}'.")
-        return all_matched
+        final_rows = [item[0] for item in matched_list]
+        logger.info(f"✅ Tìm thấy {len(final_rows)} kết quả cho từ khóa '{query}'.")
+        return final_rows
+
+    async def find_container_or_booking(self, query: str) -> List[Dict[str, Any]]:
+        """Tra cứu số container hoặc mã booking (sử dụng search_containers tối ưu)"""
+        return await self.search_containers(query)
+
+    async def find_containers_by_customer(self, customer_query: str) -> List[Dict[str, Any]]:
+        """Tra cứu container theo Tên Khách Hàng hoặc từ khóa bất kỳ"""
+        return await self.search_containers(customer_query)
 
     async def update_field(self, row_id: str, row_timestamp: str, field_name: str, new_value: str) -> bool:
         """

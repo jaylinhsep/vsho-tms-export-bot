@@ -21,11 +21,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
 import config
-from extractor_export import extract_with_gemini
+from extractor_export import extract_with_gemini, extract_pod_assignments
 from tms_export_api import TMSExportApiClient
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -136,7 +134,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   • 🏢 **Gán đơn vị vận chuyển (Đơn vị VC)**\n"
         "   • 📝 **Sửa ghi chú đóng hàng**\n"
         "   • 🗑️ **Xóa booking khỏi TMS**\n\n"
+        "5️⃣ **Đổi POD (Cột 14) hàng loạt:**\n"
+        "   • Gửi ảnh bảng điều độ kèm caption là `POD`\n"
+        "   • Hoặc dán danh sách text (dòng đầu ghi `POD`, các dòng dưới ghi số cont và mã POD như `DRYU2901546 DAN`)\n"
+        "   ➔ Bot dùng Gemini AI nhận diện hàng loạt và cập nhật trực tiếp Cột 14 trên TMS!\n\n"
         "📌 **Lệnh hữu ích:**\n"
+        "• `/pod` — Hướng dẫn hoặc đổi POD hàng loạt\n"
         "• `/status` — Kiểm tra kết nối tài khoản TMS & số lượng cont xuất hôm nay\n"
         "• `/tim <từ khóa>` — Tra cứu cont xuất theo cont hoặc booking\n"
         "• `/kh <tên khách>` — Tra cứu tất cả các cont của khách hàng (VD: `/kh Tiền`)\n"
@@ -255,6 +258,33 @@ async def xoa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=confirm_kb,
         parse_mode="Markdown",
     )
+
+
+async def pod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /pod: Đổi POD (Cột 14) hàng loạt từ văn bản hoặc xem hướng dẫn"""
+    if not is_authorized(update):
+        return
+    args_text = " ".join(context.args).strip() if context.args else ""
+    if not args_text:
+        msg = (
+            "⚓ **HƯỚNG DẪN ĐỔI CẢNG ĐẾN (POD - CỘT 14) HÀNG LOẠT:**\n\n"
+            "📸 **Cách 1: Gửi ảnh bảng điều độ**\n"
+            "• Gửi ảnh chụp bảng điều độ (Excel/Zalo) vào bot.\n"
+            "• Kèm caption là: `POD`\n"
+            "➔ Bot tự động dùng Gemini AI nhận diện Số cont và mã POD (CLO, DAN, HPG...) rồi cập nhật Cột 14 trên TMS!\n\n"
+            "📝 **Cách 2: Gõ hoặc dán danh sách text**\n"
+            "Gõ theo mẫu:\n"
+            "```\n"
+            "POD\n"
+            "DRYU2901546 DAN\n"
+            "DRYU3095229 CLO\n"
+            "DRYU3095450 CLO\n"
+            "```\n"
+            "hoặc: `/pod DRYU2901546 DAN, DRYU3095229 CLO`"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+    await handle_batch_pod_update(update, text_content=args_text)
 
 
 async def handle_query_search(update: Update, query: str):
@@ -552,7 +582,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.edit_text(f"❌ Cập nhật thất bại. Vui lòng thử lại sau.")
         return
 
-    # 2. Kiểm tra cú pháp tìm kiếm theo Tên Khách Hàng (VD: KH: Tiền, KH: Phong, KH: "Cty Tiền Phong MN")
+    # 2. Kiểm tra nếu tin nhắn yêu cầu đổi POD hàng loạt bằng văn bản
+    first_line = text.splitlines()[0].strip().upper()
+    if first_line == "POD" or first_line.startswith("POD:") or first_line.startswith("/POD"):
+        await handle_batch_pod_update(update, text_content=text)
+        return
+
+    # Nếu dán nhiều dòng bảng cont và có mã POD
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) >= 2 and any(re.search(r"\b(CLO|DAN|HPG|HPH|HCM|QNH|CLA|VPH|DNG|CMT)\b", l, re.I) for l in lines):
+        if any(re.search(r"\b[A-Z]{4}\d{7}\b", l, re.I) for l in lines) and not any(k in text.upper() for k in ["SẢN LƯỢNG", "KẾ HOẠCH", "CHI TIẾT THEO BOOKING"]):
+            await handle_batch_pod_update(update, text_content=text)
+            return
+
+    # 3. Kiểm tra cú pháp tìm kiếm theo Tên Khách Hàng (VD: KH: Tiền, KH: Phong, KH: "Cty Tiền Phong MN")
     if "\n" not in text:
         m_kh = re.match(
             r"^(?:(?:TÌM|TIM)\s+)?(?:KH|KHACH|KHÁCH|KHACH HANG|KHÁCH HÀNG)\s*[:：\s]\s*(.+)$",
@@ -564,12 +607,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_customer_search(update, query_kh)
             return
 
-    # 3. Nếu là văn bản 1 dòng (Số cont, Mã booking, Tên khách hàng, Hàng hóa, Xe...) ➔ Tra cứu đa năng
+    # 4. Nếu là văn bản 1 dòng (Số cont, Mã booking, Tên khách hàng, Hàng hóa, Xe...) ➔ Tra cứu đa năng
     if "\n" not in text:
         await handle_query_search(update, text)
         return
 
-    # 4. Nhận diện nếu là Email kế hoạch đóng hàng / trả hàng
+    # 5. Nhận diện nếu là Email kế hoạch đóng hàng / trả hàng
     email_keywords = ["BOOKING", "ĐÓNG HÀNG", "TRẢ HÀNG", "CHUYẾN", "TÀU", "KH ĐÓNG HÀNG", "KH TRẢ HÀNG", "SẢN LƯỢNG", "KẾ HOẠCH"]
     has_keywords = any(k in text.upper() for k in email_keywords)
     has_structure = "---" in text or "CHI TIẾT" in text.upper() or "\t" in text or "|" in text or len(text.splitlines()) >= 3
@@ -579,7 +622,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_email_import(update, text_content=text)
         return
 
-    # 4. Mặc định: Thử tra cứu nếu ngắn, hoặc phân tích kế hoạch nếu nhiều dòng
+    # 6. Mặc định: Thử tra cứu nếu ngắn, hoặc phân tích kế hoạch nếu nhiều dòng
     if len(text.splitlines()) > 1:
         await handle_email_import(update, text_content=text)
     else:
@@ -587,24 +630,168 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý khi người dùng gửi ảnh chụp màn hình email kế hoạch đóng hàng"""
+    """Xử lý khi người dùng gửi ảnh (kèm caption POD để đổi cảng đến, hoặc ảnh email để nhập kế hoạch)"""
     if not is_authorized(update):
         return
 
     photo = update.message.photo[-1]
-    wait_msg = await update.message.reply_text("📸 Đang tải ảnh và dùng Gemini AI phân tích bảng kế hoạch đóng hàng...")
+    caption = (update.message.caption or "").strip()
+
+    is_pod_mode = bool(re.search(r"\bpod\b", caption, re.IGNORECASE))
+
+    wait_msg = await update.message.reply_text(
+        "📸 Đang tải ảnh và nhận diện danh sách Số Cont & POD (Cột 14)..."
+        if is_pod_mode else
+        "📸 Đang tải ảnh và dùng Gemini AI phân tích bảng kế hoạch đóng hàng..."
+    )
     try:
         photo_file = await photo.get_file()
         img_buffer = BytesIO()
         await photo_file.download_to_memory(img_buffer)
         image_bytes = img_buffer.getvalue()
 
-        caption = update.message.caption or ""
         await wait_msg.delete()
-        await handle_email_import(update, text_content=caption, image_bytes=image_bytes)
+        if is_pod_mode:
+            await handle_batch_pod_update(update, text_content=caption, image_bytes=image_bytes)
+        else:
+            await handle_email_import(update, text_content=caption, image_bytes=image_bytes)
     except Exception as e:
         logger.exception(f"Lỗi tải ảnh: {e}")
         await wait_msg.edit_text(f"❌ Lỗi xử lý ảnh: {e}")
+
+
+async def handle_batch_pod_update(
+    update: Update,
+    text_content: Optional[str] = None,
+    image_bytes: Optional[bytes] = None
+):
+    """
+    Nhận diện danh sách (Số cont, Mã POD) từ ảnh hoặc văn bản,
+    sau đó tra cứu trên TMS và cập nhật hàng loạt Cột 14 (tinhXuatHangPo).
+    """
+    wait_msg = await update.message.reply_text("🤖 Đang dùng Gemini AI nhận diện danh sách Số Cont & Cảng đến (POD)...")
+    try:
+        assignments = extract_pod_assignments(text_content=text_content, image_bytes=image_bytes)
+        if not assignments:
+            await wait_msg.edit_text(
+                "❌ Không nhận diện được cặp Số Container & Cảng đến (POD) nào từ nội dung bạn gửi.\n\n"
+                "💡 Vui lòng đảm bảo:\n"
+                "• Hình ảnh bảng điều độ rõ nét, nhìn rõ cột số cont và cột cảng đến (CLO, DAN, HPG...).\n"
+                "• Hoặc gửi danh sách text có định dạng: `DRYU2901546 DAN`"
+            )
+            return
+
+        total = len(assignments)
+        preview_lines = []
+        for a in assignments[:10]:
+            c_label = a.get("so_cont") or (f"Bkg {a.get('booking')}" if a.get("booking") else "Cont ?")
+            preview_lines.append(f"• `{c_label}` ➔ ⚓ **{a.get('pod')}**")
+        if total > 10:
+            preview_lines.append(f"... và {total - 10} container khác.")
+        preview_text = "\n".join(preview_lines)
+
+        await wait_msg.edit_text(
+            f"📋 **ĐÃ NHẬN DIỆN {total} CONTAINER CẦN ĐỔI POD:**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{preview_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ Đang tra cứu trên TMS và cập nhật Cột 14 (tinhXuatHangPo)...",
+            parse_mode="Markdown"
+        )
+
+        if not tms_api.is_logged_in:
+            await tms_api.login()
+
+        success_list = []
+        not_found_list = []
+        failed_list = []
+
+        for item in assignments:
+            so_cont = (item.get("so_cont") or "").strip().upper()
+            target_pod = (item.get("pod") or "").strip().upper()
+            booking = str(item.get("booking") or "").strip()
+            so_seal = str(item.get("so_seal") or "").strip()
+            so_xe = (item.get("so_xe") or "").strip().upper()
+
+            query_key = so_cont if so_cont else booking
+            if not query_key:
+                continue
+
+            rows = await tms_api.search_containers(query_key)
+            target_row = None
+            if rows:
+                for r in rows:
+                    clean_r_cont = (r.get("so_cont") or "").replace(" ", "").upper()
+                    if so_cont and clean_r_cont == so_cont:
+                        target_row = r
+                        break
+                    if booking and str(r.get("booking_id") or "").strip() == booking:
+                        target_row = r
+                        break
+                if not target_row:
+                    target_row = rows[0]
+
+            if not target_row:
+                not_found_list.append(f"`{query_key}`")
+                continue
+
+            row_id = target_row.get("row_id", "")
+            row_ts = target_row.get("row_timestamp", "")
+            old_pod = target_row.get("pod_cot_14", "") or "Trống"
+
+            # Cập nhật Cột 14 (tinhXuatHangPo)
+            ok = await tms_api.update_field(row_id, row_ts, "pod", target_pod, clear_cache=False)
+            if ok:
+                # Nếu có số seal hoặc số xe mà trên TMS chưa có -> cập nhật luôn
+                if so_seal and not target_row.get("so_seal"):
+                    await tms_api.update_field(row_id, row_ts, "so_seal", so_seal, clear_cache=False)
+                if so_xe and not target_row.get("so_xe"):
+                    await tms_api.update_field(row_id, row_ts, "so_xe", so_xe, clear_cache=False)
+
+                success_list.append({
+                    "cont": target_row.get("so_cont") or so_cont,
+                    "booking": target_row.get("booking_id") or booking,
+                    "old_pod": old_pod,
+                    "new_pod": target_pod,
+                    "row_id": row_id,
+                })
+            else:
+                failed_list.append(f"`{query_key}`")
+
+        # Xóa cache sau khi hoàn tất toàn bộ cập nhật hàng loạt để tra cứu sau luôn lấy dữ liệu mới
+        tms_api.cache_date.clear()
+
+        # Tổng kết báo cáo
+        res_lines = [
+            f"🎉 **HOÀN TẤT ĐỔI CẢNG ĐẾN (POD - CỘT 14) HÀNG LOẠT!**\n",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"✅ **Thành công:** `{len(success_list)}/{total}` container\n"
+        ]
+
+        if success_list:
+            for s in success_list[:25]:
+                c_lbl = s['cont'] if s['cont'] else f"Bkg {s['booking']}"
+                old_p = s['old_pod']
+                res_lines.append(f"• `{c_lbl}`: `{old_p}` ➔ ⚓ **`{s['new_pod']}`** (ID `{s['row_id']}`)")
+            if len(success_list) > 25:
+                res_lines.append(f"... và {len(success_list) - 25} container khác.")
+
+        if not_found_list:
+            res_lines.append(f"\n⚠️ **Không tìm thấy trên TMS ({len(not_found_list)}):**")
+            res_lines.extend([f"• {x}" for x in not_found_list[:15]])
+
+        if failed_list:
+            res_lines.append(f"\n❌ **Lỗi khi cập nhật ({len(failed_list)}):**")
+            res_lines.extend([f"• {x}" for x in failed_list[:15]])
+
+        res_lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+        res_lines.append("💡 *Dữ liệu Cột 14 trên TMS tab XUẤT - ALL đã được đồng bộ mới nhất.*")
+
+        await wait_msg.edit_text("\n".join(res_lines), parse_mode="Markdown")
+
+    except Exception as e:
+        logger.exception(f"Lỗi đổi POD hàng loạt: {e}")
+        await wait_msg.edit_text(f"❌ Đã xảy ra lỗi khi đổi POD: {e}")
 
 
 async def handle_email_import(update: Update, text_content: Optional[str] = None, image_bytes: Optional[bytes] = None):
@@ -690,6 +877,7 @@ def create_telegram_app() -> Application:
     app.add_handler(CommandHandler("tim", tim_cmd))
     app.add_handler(CommandHandler("kh", kh_cmd))
     app.add_handler(CommandHandler("xoa", xoa_cmd))
+    app.add_handler(CommandHandler("pod", pod_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

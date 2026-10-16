@@ -547,7 +547,7 @@ class TMSExportApiClient:
         """Tra cứu container theo Tên Khách Hàng hoặc từ khóa bất kỳ"""
         return await self.search_containers(customer_query)
 
-    async def update_field(self, row_id: str, row_timestamp: str, field_name: str, new_value: str) -> bool:
+    async def update_field(self, row_id: str, row_timestamp: str, field_name: str, new_value: str, clear_cache: bool = True) -> bool:
         """
         Cập nhật 1 trường dữ liệu bất kỳ trên TMS Vietsun qua Direct API POST /index-crud.php
         Hỗ trợ CỘT 14 (POD - tinhXuatHangPo), số cont, số xe, seal, ghi chú...
@@ -651,8 +651,9 @@ class TMSExportApiClient:
             resp = await client.post(crud_url, data=payload)
             if resp.status_code == 200:
                 logger.info(f"✅ Đã cập nhật {field_name} = '{new_value}' cho dòng {row_id}")
-                # Xóa cache ngày để lượt tra cứu sau lấy dữ liệu tươi mới
-                self.cache_date.clear()
+                # Xóa cache ngày nếu được yêu cầu để lượt tra cứu sau lấy dữ liệu tươi mới
+                if clear_cache:
+                    self.cache_date.clear()
                 return True
             else:
                 logger.error(f"Lỗi cập nhật HTTP {resp.status_code}")

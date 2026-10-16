@@ -624,3 +624,152 @@ def fallback_regex_extractor(text: str) -> List[Dict[str, Any]]:
         })
 
     return results
+
+
+POD_EXTRACTION_SYSTEM_PROMPT = """
+Bạn là trợ lý AI chuyên gia bóc tách dữ liệu logistics và vận tải biển container (Hệ thống TMS Vietsun).
+Nhiệm vụ của bạn là đọc hình ảnh bảng biểu (hoặc văn bản) và trích xuất danh sách tất cả các dòng có SỐ CONTAINER (hoặc Mã Booking) cùng CẢNG ĐẾN (POD).
+
+Mỗi phần tử trong mảng JSON phải có cấu trúc:
+{
+  "so_cont": "DRYU2901546",
+  "pod": "DAN",
+  "booking": "",
+  "so_xe": "50E-48367",
+  "so_seal": "680040",
+  "khach_hang": "Cty Jotun",
+  "chuyen": "1235N",
+  "tau": "VIETSUN DYNAMIC"
+}
+
+QUY TẮC CẦN TUÂN THỦ:
+1. Số Container (so_cont): Là chuỗi 4 chữ cái in hoa + 7 chữ số (VD: DRYU2901546, DRYU3095229, DRYU3095450, GAOU2110158, VSGU4254030...).
+2. Cảng đến (pod): Là mã cảng 3-4 ký tự in hoa, thường được tô màu (xanh lá, vàng, cam...) hoặc nằm ở cột POD / Cảng đến / Tỉnh xuất hàng.
+   Các mã cảng thường gặp: CLO, DAN, HPG, HPH, HCM, QNH, CLA, VPH, DNG, CMT...
+   (LƯU Ý ĐẶC BIỆT: Trong ảnh bảng điều độ, các ô tô màu xanh lá ghi "DAN", ô tô màu vàng ghi "CLO" chính là mã POD!).
+3. Mã Booking (booking): Chuỗi 6 chữ số nếu có (VD: 298210, 300170). Nếu bảng không có cột booking thì để trống "".
+4. Biển số xe (so_xe) và Số seal (so_seal): Lấy nếu có trong dòng tương ứng.
+5. CHỈ TRÍCH XUẤT những dòng có Số Container (hoặc Booking) VÀ có mã POD. Những dòng trống số container hoặc không có định danh thì bỏ qua.
+6. Chỉ trả về duy nhất 1 mảng JSON thuần túy [ ... ], không thêm bất kỳ văn bản giải thích nào khác.
+"""
+
+
+def extract_pod_assignments_deterministic(text: str) -> List[Dict[str, Any]]:
+    """Phân tích văn bản thuần túy tìm các cặp (Số cont, Mã POD) dạng regex"""
+    results = []
+    lines = text.splitlines()
+    port_regex = r"\b(CLO|DAN|HPG|HPH|HCM|QNH|CLA|VPH|DNG|CMT)\b"
+    cont_regex = r"\b([A-Z]{4}\d{7})\b"
+    seal_regex = r"\b(\d{5,8})\b"
+    truck_regex = r"\b(\d{2}[A-Z]-\d{4,5}|\d{2}[A-Z]\d{5,6})\b"
+
+    for line in lines:
+        m_cont = re.search(cont_regex, line, re.IGNORECASE)
+        m_pod = re.search(port_regex, line, re.IGNORECASE)
+        if m_cont and m_pod:
+            cont = m_cont.group(1).upper()
+            pod = m_pod.group(1).upper()
+            m_seal = re.search(seal_regex, line)
+            m_truck = re.search(truck_regex, line, re.IGNORECASE)
+            m_booking = re.search(r"\b(\d{6})\b", line)
+            results.append({
+                "so_cont": cont,
+                "pod": pod,
+                "booking": m_booking.group(1) if m_booking else "",
+                "so_seal": m_seal.group(1) if m_seal else "",
+                "so_xe": m_truck.group(1).upper() if m_truck else "",
+            })
+    return results
+
+
+def extract_pod_assignments(text_content: Optional[str] = None, image_bytes: Optional[bytes] = None) -> List[Dict[str, Any]]:
+    """
+    Trích xuất danh sách (Container, POD) từ ảnh hoặc văn bản để cập nhật hàng loạt Cột 14 trên TMS.
+    Ưu tiên gọi Gemini AI nếu có ảnh, hoặc dùng regex parser nếu là văn bản đơn giản.
+    """
+    # 1. Thử nhận diện bằng regex nếu chỉ có text và có cặp cont + pod
+    if text_content and not image_bytes:
+        det_results = extract_pod_assignments_deterministic(text_content)
+        if det_results:
+            logger.info(f"✅ Đã nhận diện được {len(det_results)} cặp (Cont, POD) bằng deterministic regex!")
+            return det_results
+
+    # 2. Dùng Gemini AI nếu có ảnh hoặc text phức tạp
+    if not config.GEMINI_API_KEY:
+        logger.warning("Chưa cấu hình GEMINI_API_KEY")
+        if text_content:
+            return extract_pod_assignments_deterministic(text_content)
+        return []
+
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=config.GEMINI_API_KEY)
+        contents = []
+
+        if image_bytes:
+            contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/png"))
+
+        prompt_text = text_content or ""
+        prompt_text += "\nHãy trích xuất toàn bộ danh sách các dòng có Số Container và Cảng đến (POD) thành mảng JSON theo quy tắc."
+        contents.append(prompt_text)
+
+        candidate_models = [
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+        ]
+
+        response = None
+        for m_name in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=m_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=POD_EXTRACTION_SYSTEM_PROMPT,
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                    ),
+                )
+                if response and response.text:
+                    logger.info(f"✅ Gemini API ({m_name}) đã bóc tách Cont & POD thành công!")
+                    break
+            except Exception as e_sub:
+                logger.warning(f"Model {m_name} không khả dụng cho POD: {e_sub}")
+                continue
+
+        if not response or not response.text:
+            logger.error("Không nhận được phản hồi POD từ Gemini API")
+            if text_content:
+                return extract_pod_assignments_deterministic(text_content)
+            return []
+
+        raw_out = response.text.strip()
+        if "```" in raw_out:
+            m_block = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", raw_out, re.DOTALL)
+            if m_block:
+                raw_out = m_block.group(1).strip()
+            else:
+                raw_out = re.sub(r"^```(?:json)?", "", raw_out)
+                raw_out = re.sub(r"```$", "", raw_out).strip()
+
+        data = json.loads(raw_out)
+        if isinstance(data, list):
+            # Lọc bỏ các phần tử không có cả số cont lẫn booking
+            filtered = [
+                d for d in data
+                if isinstance(d, dict) and (d.get("so_cont") or d.get("booking")) and d.get("pod")
+            ]
+            return filtered
+        elif isinstance(data, dict):
+            if (data.get("so_cont") or data.get("booking")) and data.get("pod"):
+                return [data]
+        return []
+
+    except Exception as e:
+        logger.exception(f"Lỗi khi trích xuất POD bằng Gemini: {e}")
+        if text_content:
+            return extract_pod_assignments_deterministic(text_content)
+        return []

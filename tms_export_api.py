@@ -602,6 +602,44 @@ class TMSExportApiClient:
             logger.exception(f"Lỗi khi gửi CRUD cập nhật: {e}")
             return False
 
+    async def delete_export_booking_row(self, row_id: str) -> bool:
+        """
+        Xóa vĩnh viễn dòng container/booking xuất khỏi tab XUẤT - ALL trên Vietsun TMS.
+        Tương ứng hàm xoaPoXuat() trên giao diện web TMS:
+        POST /index-crud.php (cv: 4, loai: 19, iddt: 1, cot: 0, thongtin: row_id)
+        """
+        if not self.is_logged_in:
+            await self.login()
+
+        client = await self.get_client()
+        crud_url = f"{config.TMS_URL}/index-crud.php"
+        payload = {
+            "TenDangNhap": config.TMS_USERNAME,
+            "userString": self.user_string,
+            "cv": 4,
+            "loai": 19,
+            "iddt": 1,
+            "cot": 0,
+            "thongtin": str(row_id).strip(),
+            "minData": "",
+            "maxData": "",
+        }
+
+        try:
+            logger.info(f"🗑️ Đang xóa dòng ID PVT {row_id} trên tab XUẤT - ALL (cv: 4, loai: 19)...")
+            resp = await client.post(crud_url, data=payload)
+            if resp.status_code == 200:
+                logger.info(f"✅ Đã xóa thành công dòng ID PVT {row_id} khỏi TMS!")
+                # Xóa toàn bộ cache để lần sau không còn dòng này
+                self.cache_date.clear()
+                return True
+            else:
+                logger.error(f"Lỗi xóa dòng {row_id}: HTTP {resp.status_code}")
+                return False
+        except Exception as e:
+            logger.exception(f"Lỗi khi gửi request xóa dòng {row_id}: {e}")
+            return False
+
     async def create_export_booking_row(self, item: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """
         Quy trình tự động bấm Dấu cộng [+] và tạo dòng đóng hàng xuất:

@@ -85,7 +85,7 @@ def build_container_card(r: Dict[str, Any]) -> str:
         f"• **Sản lượng:** {sl_str} {f'| **GW:** {gw}T' if gw else ''}\n"
         f"• **Số Cont:** `{cont}`\n"
         f"• **Số Seal:** `{seal}`\n"
-        f"• **Đơn vị VC / Xe:** {f'{dvvc} - ' if dvvc else ''}`{so_xe}`\n"
+        f"• **Đơn vị VC:** `{dvvc or '*(Chưa gán)*'}` | **Số Xe:** `{so_xe}`\n"
         f"• ⚓ **Cảng đến (POD - Cột 14):** `{pod_14}`\n"
         f"• **Port hạ hàng:** {port_ha}\n"
         f"{f'• **Liên hệ kho:** {lien_he}\n' if lien_he else ''}"
@@ -108,8 +108,12 @@ def build_container_keyboard(row_id: str, row_timestamp: str) -> InlineKeyboardM
             InlineKeyboardButton("🔒 Gán Số Seal", callback_data=f"edit_seal_{row_id}_{row_timestamp}"),
         ],
         [
+            InlineKeyboardButton("🏢 Gán Đơn Vị VC", callback_data=f"edit_carrier_{row_id}_{row_timestamp}"),
             InlineKeyboardButton("📝 Sửa Ghi Chú", callback_data=f"edit_note_{row_id}_{row_timestamp}"),
+        ],
+        [
             InlineKeyboardButton("🔄 Làm Mới", callback_data=f"refresh_{row_id}_{row_timestamp}"),
+            InlineKeyboardButton("🗑️ Xóa Booking", callback_data=f"delask_{row_id}_{row_timestamp}"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -128,11 +132,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   • ✏️ **Gán / Đổi số cont**\n"
         "   • 🚚 **Gán biển số xe**\n"
         "   • 🔒 **Gán số seal**\n"
-        "   • 📝 **Sửa ghi chú đóng hàng**\n\n"
+        "   • 🏢 **Gán đơn vị vận chuyển (Đơn vị VC)**\n"
+        "   • 📝 **Sửa ghi chú đóng hàng**\n"
+        "   • 🗑️ **Xóa booking khỏi TMS**\n\n"
         "📌 **Lệnh hữu ích:**\n"
         "• `/status` — Kiểm tra kết nối tài khoản TMS & số lượng cont xuất hôm nay\n"
         "• `/tim <từ khóa>` — Tra cứu cont xuất theo cont hoặc booking\n"
         "• `/kh <tên khách>` — Tra cứu tất cả các cont của khách hàng (VD: `/kh Tiền`)\n"
+        "• `/xoa <id>` — Xóa booking khỏi TMS theo ID PVT (VD: `/xoa 208371`)\n"
         f"• Chat ID của bạn: `{chat_id}`"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -222,6 +229,31 @@ async def kh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = " ".join(context.args).strip().strip('"').strip("'").strip()
     await handle_customer_search(update, query)
+
+
+async def xoa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh xóa booking trực tiếp theo ID PVT: /xoa <row_id>"""
+    if not is_authorized(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text("👉 Vui lòng nhập ID PVT cần xóa. Ví dụ: `/xoa 208371`", parse_mode="Markdown")
+        return
+
+    row_id = context.args[0].strip()
+    confirm_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑️ XÁC NHẬN XÓA", callback_data=f"delconfirm_{row_id}_"),
+            InlineKeyboardButton("❌ Hủy Bỏ", callback_data=f"delcancel_{row_id}_"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"⚠️ **CẢNH BÁO XÓA BOOKING KHỎI TMS**\n\n"
+        f"Bạn có chắc chắn muốn **xóa vĩnh viễn dòng ID PVT `{row_id}`** trên tab XUẤT - ALL không?\n\n"
+        f"🚨 *Lưu ý: Dòng này sẽ bị xóa trực tiếp khỏi hệ thống TMS Vietsun và không thể khôi phục!*",
+        reply_markup=confirm_kb,
+        parse_mode="Markdown",
+    )
 
 
 async def handle_query_search(update: Update, query: str):
@@ -358,8 +390,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Không tìm thấy thông tin dòng {row_id} sau khi làm mới.")
         return
 
+    if action == "delask":
+        row_id = parts[1]
+        row_ts = parts[2] if len(parts) > 2 else ""
+
+        confirm_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🗑️ XÁC NHẬN XÓA", callback_data=f"delconfirm_{row_id}_{row_ts}"),
+                InlineKeyboardButton("❌ Hủy Bỏ", callback_data=f"delcancel_{row_id}_{row_ts}"),
+            ]
+        ])
+        await query.message.reply_text(
+            f"⚠️ **CẢNH BÁO XÓA BOOKING KHỎI TMS**\n\n"
+            f"Bạn có chắc chắn muốn **xóa vĩnh viễn dòng ID PVT `{row_id}`** trên tab XUẤT - ALL không?\n\n"
+            f"🚨 *Lưu ý: Dòng này sẽ bị xóa trực tiếp khỏi hệ thống TMS Vietsun và không thể khôi phục!*",
+            reply_markup=confirm_kb,
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "delconfirm":
+        row_id = parts[1]
+        row_ts = parts[2] if len(parts) > 2 else ""
+        await query.edit_message_text(f"⏳ Đang thực hiện xóa dòng ID PVT `{row_id}` trên TMS Vietsun...")
+
+        if not tms_api.is_logged_in:
+            await tms_api.login()
+
+        ok = await tms_api.delete_export_booking_row(row_id)
+        if ok:
+            await query.edit_message_text(
+                f"✅ **ĐÃ XÓA THÀNH CÔNG KHỎI TMS!**\n\n"
+                f"• ID PVT: `{row_id}`\n"
+                f"• Dòng booking đã được xóa hoàn toàn khỏi tab XUẤT - ALL của TMS Vietsun.",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Xóa dòng `{row_id}` thất bại. Vui lòng kiểm tra lại kết nối TMS hoặc đăng nhập lại.",
+                parse_mode="Markdown",
+            )
+        return
+
+    if action == "delcancel":
+        row_id = parts[1]
+        await query.edit_message_text(f"❌ Đã hủy thao tác xóa dòng ID PVT `{row_id}`.")
+        return
+
     if action == "edit":
-        field_type = parts[1]  # pod, cont, truck, seal, note
+        field_type = parts[1]  # pod, cont, truck, seal, note, carrier
         row_id = parts[2]
         row_ts = parts[3] if len(parts) > 3 else ""
 
@@ -377,6 +456,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "cont": "✏️ **Số Container** (VD: `GAOU2111920`, `DRYU3022599`)",
             "truck": "🚚 **Biển Số Xe** (VD: `50H10224`, `61H10617`)",
             "seal": "🔒 **Số Seal** (VD: `688441`)",
+            "carrier": "🏢 **Đơn Vị Vận Chuyển (Đơn vị VC)** (VD: `VSHO`, `THAI HOA`, `TRUCKING 14`)",
             "note": "📝 **Ghi Chú Đóng Hàng** (VD: `Sáng`, `Chiều`, `Lên trưa`)",
         }
 
@@ -417,6 +497,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "cont": "so_cont",
             "truck": "so_xe",
             "seal": "so_seal",
+            "carrier": "don_vi_vc",
+            "dvvc": "don_vi_vc",
             "note": "ghi_chu",
         }
         target_field = field_map.get(field_type, field_type)
@@ -583,6 +665,7 @@ def create_telegram_app() -> Application:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("tim", tim_cmd))
     app.add_handler(CommandHandler("kh", kh_cmd))
+    app.add_handler(CommandHandler("xoa", xoa_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))

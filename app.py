@@ -4,7 +4,8 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from io import BytesIO
-from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Set, Tuple
 
 import uvicorn
 from fastapi import FastAPI
@@ -23,7 +24,7 @@ from telegram.ext import (
 )
 import config
 from extractor_export import extract_with_gemini, extract_pod_assignments
-from tms_export_api import TMSExportApiClient
+from tms_export_api import TMSExportApiClient, remove_accents
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -72,6 +73,10 @@ def build_container_card(r: Dict[str, Any]) -> str:
     lien_he = r.get("lien_he", "") or ""
     ghi_chu = r.get("ghi_chu", "") or "*(Trống)*"
 
+    tinh_suffix = f"({tinh})" if tinh else ""
+    gw_suffix = f"| **GW:** {gw}T" if gw else ""
+    lien_he_line = f"• **Liên hệ kho:** {lien_he}\n" if lien_he else ""
+
     card = (
         f"📦 **CHI TIẾT CONTAINER XUẤT**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -80,14 +85,14 @@ def build_container_card(r: Dict[str, Any]) -> str:
         f"• **Ngày đóng:** `{ngay_dong}` | **Ngày tàu chạy:** `{ngay_chay}`\n"
         f"• **Khách hàng:** {khach}\n"
         f"• **Hàng hóa:** {r.get('ten_hang') or 'Chưa rõ'}\n"
-        f"• **Kho đóng:** {kho} {f'({tinh})' if tinh else ''}\n"
-        f"• **Sản lượng:** {sl_str} {f'| **GW:** {gw}T' if gw else ''}\n"
+        f"• **Kho đóng:** {kho} {tinh_suffix}\n"
+        f"• **Sản lượng:** {sl_str} {gw_suffix}\n"
         f"• **Số Cont:** `{cont}`\n"
         f"• **Số Seal:** `{seal}`\n"
         f"• **Đơn vị VC:** `{dvvc or '*(Chưa gán)*'}` | **Số Xe:** `{so_xe}`\n"
         f"• ⚓ **Cảng đến (POD - Cột 14):** `{pod_14}`\n"
         f"• **Port hạ hàng:** {port_ha}\n"
-        f"{f'• **Liên hệ kho:** {lien_he}\n' if lien_he else ''}"
+        f"{lien_he_line}"
         f"• **Ghi chú đóng:** {ghi_chu}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👇 *Bấm nút bên dưới để chỉnh sửa và submit ngược lên TMS:*"
@@ -123,24 +128,27 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🚢 **Bot Quản Lý Hàng Xuất (VSHO TMS Vietsun)**\n\n"
         "⚡ **Tính năng chính:**\n"
-        "1️⃣ **Nhập kế hoạch tự động:** Chỉ cần copy toàn bộ nội dung email kế hoạch đóng hàng (hoặc gửi ảnh chụp màn hình email) dán vào đây ➔ Bot tự động bấm `[+]` và điền toàn bộ thông tin lên TMS.\n\n"
-        "2️⃣ **Tra cứu cont xuất đơn lẻ:** Gõ trực tiếp số cont (VD: `GAOU2111920`) hoặc mã booking (VD: `300170`), hoặc gõ lệnh `/tim <từ khóa>`.\n\n"
-        "3️⃣ **Tra cứu hàng loạt theo Khách hàng:** Gõ `KH: <từ khóa>` (VD: `KH: Tiền`, `KH: Phong`, `KH: Cty Tiền Phong`) hoặc lệnh `/kh <từ khóa>` ➔ Bot trả về danh sách tất cả các cont của khách đó kèm nút bấm sửa trực tiếp từng cont!\n\n"
-        "4️⃣ **Chỉnh sửa & Submit ngược lại TMS:** Có sẵn nút bấm trực tiếp dưới mỗi kết quả tra cứu:\n"
+        "1️⃣ **Nhập kế hoạch tự động:** Chỉ cần copy nội dung email kế hoạch đóng hàng (hoặc gửi ảnh email) dán vào đây ➔ Bot tự động bấm `[+]` và điền toàn bộ lên TMS.\n\n"
+        "2️⃣ **Xem kế hoạch theo ngày (Hôm nay, +1, +2, +3):**\n"
+        "   • Gõ lệnh `/ngay` — Hiện bảng tổng quan 4 ngày kế hoạch kèm 4 nút bấm chọn ngày.\n"
+        "   • Hoặc gõ chữ trực tiếp: `hôm nay`, `mai`, `mốt`, `kia`, hoặc ngày `17/10` ➔ Bot hiện ngay danh sách cont ngày đó!\n"
+        "   • Có thể tìm theo ngày + khách: `mai Tiền`, `17/10 Jotun`...\n\n"
+        "3️⃣ **Tra cứu cont xuất đơn lẻ:** Gõ trực tiếp số cont (VD: `GAOU2111920`) hoặc mã booking (VD: `300170`), hoặc gõ lệnh `/tim <từ khóa>`.\n\n"
+        "4️⃣ **Tra cứu hàng loạt theo Khách hàng:** Gõ `KH: <từ khóa>` (VD: `KH: Tiền`, `KH: Phong`) hoặc `/kh <từ khóa>`.\n\n"
+        "5️⃣ **Chỉnh sửa & Submit ngược lại TMS:** Có sẵn nút bấm trực tiếp dưới mỗi container:\n"
         "   • ⚓ **Đổi POD (Gán vào Cột 14 TMS)**\n"
         "   • ✏️ **Gán / Đổi số cont**\n"
-        "   • 🚚 **Gán biển số xe**\n"
-        "   • 🔒 **Gán số seal**\n"
-        "   • 🏢 **Gán đơn vị vận chuyển (Đơn vị VC)**\n"
-        "   • 📝 **Sửa ghi chú đóng hàng**\n"
-        "   • 🗑️ **Xóa booking khỏi TMS**\n\n"
-        "5️⃣ **Đổi POD (Cột 14) hàng loạt:**\n"
+        "   • 🚚 **Gán biển số xe** | 🔒 **Gán số seal**\n"
+        "   • 🏢 **Gán đơn vị VC** | 📝 **Sửa ghi chú** | 🗑️ **Xóa booking**\n\n"
+        "6️⃣ **Đổi POD (Cột 14) hàng loạt:**\n"
         "   • Gửi ảnh bảng điều độ kèm caption là `POD`\n"
-        "   • Hoặc dán danh sách text (dòng đầu ghi `POD`, các dòng dưới ghi số cont và mã POD như `DRYU2901546 DAN`)\n"
-        "   ➔ Bot dùng Gemini AI nhận diện hàng loạt và cập nhật trực tiếp Cột 14 trên TMS!\n\n"
+        "   • Hoặc dán danh sách text (dòng 1 ghi `POD`, các dòng dưới ghi `DRYU2901546 DAN`)\n"
+        "   ➔ Bot tự động nhận diện và cập nhật Cột 14 hàng loạt lên TMS!\n\n"
         "📌 **Lệnh hữu ích:**\n"
-        "• `/pod` — Hướng dẫn hoặc đổi POD hàng loạt\n"
-        "• `/status` — Kiểm tra kết nối tài khoản TMS & số lượng cont xuất hôm nay\n"
+        "• `/ngay` — Bảng tổng quan kế hoạch 4 ngày (Hôm nay, Ngày mai, Ngày mốt, Ngày kia)\n"
+        "• `/pod` — Hướng dẫn đổi POD hàng loạt\n"
+        "• `/models` — Kiểm tra kết nối AI Google Gemini\n"
+        "• `/status` — Kiểm tra kết nối TMS & số lượng cont 4 ngày tới\n"
         "• `/tim <từ khóa>` — Tra cứu cont xuất theo cont hoặc booking\n"
         "• `/kh <tên khách>` — Tra cứu tất cả các cont của khách hàng (VD: `/kh Tiền`)\n"
         "• `/xoa <id>` — Xóa booking khỏi TMS theo ID PVT (VD: `/xoa 208371`)\n"
@@ -164,42 +172,81 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.edit_text(f"❌ Đăng nhập TMS thất bại: `{err_detail}`\nVui lòng kiểm tra tài khoản/mật khẩu TMS.")
             return
 
-        from datetime import datetime
-        today_str = datetime.now(tms_api.VN_TZ if hasattr(tms_api, "VN_TZ") else None).strftime("%Y-%m-%d") if hasattr(tms_api, "VN_TZ") else datetime.now().strftime("%Y-%m-%d")
-        rows = await tms_api.fetch_table_for_date(today_str, force_refresh=True)
+        summary_days = await tms_api.get_plan_summary_4_days()
         elapsed = round(time.time() - t0, 2)
-        dbg = getattr(tms_api, "last_fetch_debug", {})
 
-        if len(rows) > 0:
-            await wait_msg.edit_text(
-                f"✅ **Hệ thống VSHO TMS Hoạt Động Bình Thường!**\n\n"
-                f"👤 Tài khoản: `{config.TMS_USERNAME}`\n"
-                f"📊 Tab đang kết nối: **XUẤT - ALL** (kieuXemTrucking=2)\n"
-                f"📦 Số lượng cont xuất hôm nay ({today_str}): **{len(rows)}** cont\n"
-                f"⚡ Tốc độ phản hồi: `{elapsed}s`\n"
-                f"🔑 Gemini AI: `{'Đã cấu hình' if config.GEMINI_API_KEY else 'Chưa có key (dùng regex)'}`",
-                parse_mode="Markdown",
-            )
-        else:
-            sample_txt = dbg.get("sample", "Trống")
-            err_txt = dbg.get("err", "Không có exception")
-            size_txt = dbg.get("size", 0)
-            status_http = dbg.get("status", "N/A")
-            await wait_msg.edit_text(
-                f"⚠️ **Đã kết nối TMS nhưng nhận được 0 container:**\n\n"
-                f"👤 Tài khoản: `{config.TMS_USERNAME}`\n"
-                f"📅 Ngày kiểm tra: `{today_str}`\n"
-                f"⚡ Tốc độ: `{elapsed}s`\n\n"
-                f"🔍 **Chi tiết kỹ thuật:**\n"
-                f"• HTTP Status: `{status_http}` | Dung lượng: `{size_txt} bytes`\n"
-                f"• Nội dung phản hồi: `{sample_txt}`\n"
-                f"• Lỗi: `{err_txt}`\n\n"
-                f"💡 Gợi ý: Hãy thử tra cứu 1 số cont cụ thể (VD: `DRYU9591226` hoặc `VSGU4254030`).",
-                parse_mode="Markdown",
-            )
+        gemini_info = (
+            f"Đã nhận key ({config.GEMINI_API_KEY[:6]}...)"
+            if (config.GEMINI_API_KEY and config.GEMINI_API_KEY != "key_gemini_cua_ban")
+            else "Chưa có key hoặc đang dùng key mẫu ❌ (Gõ /models để xem)"
+        )
+
+        sum_lines = []
+        buttons = []
+        row_btn = []
+        for d in summary_days:
+            sum_lines.append(f"• 📅 **{d['label']}** (`{d['date_dmy']}`): **{d['count']}** cont")
+            short_lbl = d['label'].split(' (')[0]
+            btn_txt = f"{short_lbl} ({d['date_dm']}): {d['count']}c"
+            row_btn.append(InlineKeyboardButton(btn_txt, callback_data=f"viewday_{d['offset']}_{d['date_iso']}"))
+            if len(row_btn) == 2:
+                buttons.append(row_btn)
+                row_btn = []
+        if row_btn:
+            buttons.append(row_btn)
+
+        sum_text = "\n".join(sum_lines)
+        kb = InlineKeyboardMarkup(buttons)
+
+        await wait_msg.edit_text(
+            f"✅ **Hệ thống VSHO TMS Hoạt Động Bình Thường!**\n\n"
+            f"👤 Tài khoản: `{config.TMS_USERNAME}`\n"
+            f"📊 Tab đang kết nối: **XUẤT - ALL** (kieuXemTrucking=2)\n\n"
+            f"📦 **Kế hoạch đóng hàng 4 ngày tới:**\n"
+            f"{sum_text}\n\n"
+            f"⚡ Tốc độ phản hồi: `{elapsed}s`\n"
+            f"🔑 Gemini AI: `{gemini_info}`\n\n"
+            f"👇 *Bấm nút bên dưới để xem chi tiết danh sách từng ngày:*",
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
     except Exception as e:
         logger.exception("Lỗi status")
         await wait_msg.edit_text(f"❌ Lỗi kiểm tra kết nối: {e}")
+
+
+async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kiểm tra kết nối và danh sách models từ Google Gemini API"""
+    if not is_authorized(update):
+        return
+    if not config.GEMINI_API_KEY or config.GEMINI_API_KEY == "key_gemini_cua_ban":
+        await update.message.reply_text(
+            "❌ **Chưa cấu hình GEMINI_API_KEY hợp lệ!**\n\n"
+            "Vui lòng mở file `.env` trên VPS và thêm API Key từ Google AI Studio:\n"
+            "`GEMINI_API_KEY=AIzaSy...`",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = await update.message.reply_text("🔍 Đang kết nối tới Google Gemini API để kiểm tra...")
+    try:
+        from google import genai
+        client = genai.Client(api_key=config.GEMINI_API_KEY)
+        models = []
+        for m in client.models.list():
+            raw = getattr(m, "name", "").replace("models/", "")
+            models.append(raw)
+
+        flash_models = [m for m in models if "flash" in m]
+        await msg.edit_text(
+            f"✅ **Kết nối Google Gemini AI Thành Công!**\n\n"
+            f"🔑 Key: `{config.GEMINI_API_KEY[:6]}...{config.GEMINI_API_KEY[-4:]}`\n"
+            f"⚡ Số lượng models: {len(models)}\n"
+            f"🌟 Các model Flash khả dụng:\n• " + "\n• ".join(flash_models[:6]),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Kết nối Gemini thất bại:\n`{e}`\n\nVui lòng kiểm tra lại GEMINI_API_KEY trong file .env.")
 
 
 async def tim_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,6 +334,275 @@ async def pod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_batch_pod_update(update, text_content=args_text)
 
 
+def parse_date_query(text: str):
+    """
+    Phân tích chuỗi tìm kiếm để nhận diện ngày kế hoạch:
+    Trả về: (date_iso, date_dmy, label) hoặc None
+    """
+    clean = text.strip().lower()
+    today = datetime.now(tms_api.VN_TZ)
+
+    # 1. Các từ khóa tương đối
+    if clean in ("hom nay", "hôm nay", "nay", "today", "day0", "0", "+0", "d0"):
+        d = today
+        return d.strftime("%Y-%m-%d"), d.strftime("%d/%m/%Y"), "Hôm nay"
+
+    if clean in ("mai", "ngay mai", "ngày mai", "tomorrow", "day1", "day+1", "1", "+1", "d1"):
+        d = today + timedelta(days=1)
+        return d.strftime("%Y-%m-%d"), d.strftime("%d/%m/%Y"), "Ngày mai (+1)"
+
+    if clean in ("mot", "mốt", "ngay mot", "ngày mốt", "day2", "day+2", "2", "+2", "d2"):
+        d = today + timedelta(days=2)
+        return d.strftime("%Y-%m-%d"), d.strftime("%d/%m/%Y"), "Ngày mốt (+2)"
+
+    if clean in ("kia", "ngay kia", "ngày kia", "day3", "day+3", "3", "+3", "d3"):
+        d = today + timedelta(days=3)
+        return d.strftime("%Y-%m-%d"), d.strftime("%d/%m/%Y"), "Ngày kia (+3)"
+
+    # 2. Định dạng ngày cụ thể DD/MM hoặc DD/MM/YYYY
+    m = re.match(r"^(\d{1,2})[-/](\d{1,2})(?:[-/](\d{4}))?$", clean)
+    if m:
+        day_n = int(m.group(1))
+        mon_n = int(m.group(2))
+        yr_n = int(m.group(3)) if m.group(3) else today.year
+        try:
+            target_dt = datetime(yr_n, mon_n, day_n, tzinfo=tms_api.VN_TZ)
+            diff_days = (target_dt.date() - today.date()).days
+            if diff_days == 0:
+                lbl = "Hôm nay"
+            elif diff_days == 1:
+                lbl = "Ngày mai (+1)"
+            elif diff_days == 2:
+                lbl = "Ngày mốt (+2)"
+            elif diff_days == 3:
+                lbl = "Ngày kia (+3)"
+            else:
+                lbl = f"Ngày {day_n:02d}/{mon_n:02d}/{yr_n}"
+            return target_dt.strftime("%Y-%m-%d"), target_dt.strftime("%d/%m/%Y"), lbl
+        except Exception:
+            return None
+
+    return None
+
+
+def extract_date_and_query(text: str):
+    """Tách phần ngày và phần từ khóa phụ nếu có (VD: 'mai Tiền' -> (ngay_mai, 'Tiền'))"""
+    parts = text.strip().split()
+    if len(parts) >= 2:
+        if len(parts) >= 3:
+            dt_res = parse_date_query(" ".join(parts[:2]))
+            if dt_res:
+                extra = " ".join(parts[2:]).strip()
+                return dt_res, extra
+        dt_res = parse_date_query(parts[0])
+        if dt_res:
+            extra = " ".join(parts[1:]).strip()
+            return dt_res, extra
+        dt_res = parse_date_query(parts[-1])
+        if dt_res:
+            extra = " ".join(parts[:-1]).strip()
+            return dt_res, extra
+
+    dt_res = parse_date_query(text)
+    if dt_res:
+        return dt_res, ""
+
+    return None, text
+
+
+async def handle_plan_overview(update: Update):
+    """Hiển thị bảng tổng quan kế hoạch 4 ngày kèm 4 nút bấm chọn ngày"""
+    wait_msg = await update.message.reply_text("🔄 Đang lấy dữ liệu kế hoạch 4 ngày từ TMS Vietsun...")
+    try:
+        t0 = time.time()
+        summary_days = await tms_api.get_plan_summary_4_days()
+        elapsed = round(time.time() - t0, 2)
+
+        sum_lines = []
+        buttons = []
+        row_btn = []
+        for d in summary_days:
+            sum_lines.append(f"• 📅 **{d['label']}** (`{d['date_dmy']}`): **{d['count']}** cont")
+            short_lbl = d['label'].split(' (')[0]
+            btn_txt = f"{short_lbl} ({d['date_dm']}): {d['count']}c"
+            row_btn.append(InlineKeyboardButton(btn_txt, callback_data=f"viewday_{d['offset']}_{d['date_iso']}"))
+            if len(row_btn) == 2:
+                buttons.append(row_btn)
+                row_btn = []
+        if row_btn:
+            buttons.append(row_btn)
+
+        sum_text = "\n".join(sum_lines)
+        kb = InlineKeyboardMarkup(buttons)
+
+        await wait_msg.edit_text(
+            f"📅 **KẾ HOẠCH ĐÓNG HÀNG 4 NGÀY TỚI (XUẤT - ALL):**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{sum_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ Tốc độ quét: `{elapsed}s`\n\n"
+            f"👇 *Bấm nút bên dưới để xem danh sách & chỉnh sửa từng container:*",
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Lỗi xem kế hoạch 4 ngày")
+        await wait_msg.edit_text(f"❌ Lỗi khi lấy kế hoạch: {e}")
+
+
+async def handle_date_plan_display(
+    target,
+    date_iso: str,
+    date_dmy: str,
+    label: str,
+    filter_keyword: str = "",
+    wait_msg=None,
+    is_callback: bool = False
+):
+    """Hiển thị danh sách container cho 1 ngày cụ thể kèm thẻ chi tiết và nút bấm chỉnh sửa"""
+    send_msg = wait_msg
+    prefix = f" cho từ khóa '{filter_keyword}'" if filter_keyword else ""
+    if not send_msg:
+        if is_callback:
+            await target.answer()
+            send_msg = await target.message.reply_text(f"⏳ Đang tải kế hoạch {label} ({date_dmy}){prefix} từ TMS...")
+        else:
+            send_msg = await target.message.reply_text(f"⏳ Đang tải kế hoạch {label} ({date_dmy}){prefix} từ TMS...")
+
+    try:
+        raw_rows = await tms_api.fetch_rows_for_date_clean(date_iso, force_refresh=False)
+
+        # Lọc theo từ khóa phụ nếu có (VD: 'mai Tiền' -> chỉ lấy cont khách Tiền)
+        if filter_keyword:
+            clean_fk = remove_accents(filter_keyword).strip()
+            matched_rows = []
+            for r in raw_rows:
+                is_m, _ = tms_api.row_matches_query(r, clean_fk, filter_keyword)
+                if is_m:
+                    matched_rows.append(r)
+            results = matched_rows
+        else:
+            results = raw_rows
+
+        if not results:
+            msg = f"ℹ️ Không có container nào trong kế hoạch đóng hàng **{label} ({date_dmy})**"
+            if filter_keyword:
+                msg += f" khớp với từ khóa **'{filter_keyword}'**."
+            else:
+                msg += " trên TMS."
+            await send_msg.edit_text(msg, parse_mode="Markdown")
+            return
+
+        total = len(results)
+        summary_lines = []
+        for i, r in enumerate(results, start=1):
+            cont = r.get("so_cont") or "Chưa có cont"
+            booking = r.get("booking_id") or "N/A"
+            tau = r.get("tau") or "Chưa rõ tàu"
+            chuyen = r.get("chuyen") or ""
+            tau_str = f"{tau} ({chuyen})" if chuyen else tau
+            pod = r.get("pod_cot_14") or "Chưa gán POD"
+            khach = r.get("khach_hang") or "Chưa có tên"
+            ten_hang = r.get("ten_hang") or ""
+            xe = r.get("so_xe") or "Chưa gán xe"
+            hang_str = f" | 🌾 _{ten_hang}_" if ten_hang else ""
+            line = (
+                f"{i}. 📦 Cont: `{cont}` | 🔖 `{booking}` | ⚓ POD: `{pod}`\n"
+                f"   🚢 {tau_str} | 🚚 `{xe}`\n"
+                f"   🏢 _{khach}_{hang_str}"
+            )
+            summary_lines.append(line)
+
+        summary_text = "\n".join(summary_lines[:15])
+        if total > 15:
+            summary_text += f"\n... và còn {total - 15} container khác."
+
+        filter_suffix = f" (LỌC THEO: '{filter_keyword.upper()}')" if filter_keyword else ""
+        header = (
+            f"📅 **KẾ HOẠCH {label.upper()} ({date_dmy}){filter_suffix}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Tổng cộng: **{total}** container\n\n"
+            f"{summary_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 *Dưới đây là chi tiết từng container. Bấm nút để chỉnh sửa và submit ngược lên TMS:*"
+        )
+        await send_msg.edit_text(header, parse_mode="Markdown")
+
+        # Gửi tối đa 8 container card
+        max_cards = min(8, total)
+        for r in results[:max_cards]:
+            card_text = build_container_card(r)
+            kb = build_container_keyboard(r.get("row_id", ""), r.get("row_timestamp", ""))
+            if is_callback:
+                await target.message.reply_text(card_text, reply_markup=kb, parse_mode="Markdown")
+            else:
+                await target.message.reply_text(card_text, reply_markup=kb, parse_mode="Markdown")
+            await asyncio.sleep(0.15)
+
+        if total > max_cards:
+            note_msg = f"ℹ️ *Đã hiển thị {max_cards}/{total} container.* Bạn có thể gõ trực tiếp số cont hoặc mã booking để chỉnh sửa các cont còn lại."
+            if is_callback:
+                await target.message.reply_text(note_msg, parse_mode="Markdown")
+            else:
+                await target.message.reply_text(note_msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.exception(f"Lỗi hiển thị kế hoạch ngày {date_iso}: {e}")
+        await send_msg.edit_text(f"❌ Lỗi khi tải dữ liệu ngày {date_dmy}: {e}")
+
+
+async def ngay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /ngay hoặc /plan hoặc /kehoach: Xem kế hoạch đóng hàng theo ngày"""
+    if not is_authorized(update):
+        return
+
+    args_text = " ".join(context.args).strip() if context.args else ""
+    if not args_text:
+        await handle_plan_overview(update)
+        return
+
+    dt_res, extra = extract_date_and_query(args_text)
+    if dt_res:
+        date_iso, date_dmy, label = dt_res
+        await handle_date_plan_display(
+            update,
+            date_iso=date_iso,
+            date_dmy=date_dmy,
+            label=label,
+            filter_keyword=extra,
+            is_callback=False
+        )
+    else:
+        await update.message.reply_text(
+            "👉 Vui lòng nhập ngày cần xem hợp lệ. Ví dụ:\n"
+            "• `/ngay` — Xem tổng quan 4 ngày kèm nút chọn\n"
+            "• `/ngay mai` hoặc `/mai` — Xem ngày mai (+1)\n"
+            "• `/ngay mot` hoặc `/mot` — Xem ngày mốt (+2)\n"
+            "• `/ngay kia` hoặc `/kia` — Xem ngày kia (+3)\n"
+            "• `/ngay 17/10` — Xem ngày cụ thể\n"
+            "• `/ngay mai Tiền` — Xem cont khách Tiền ngày mai",
+            parse_mode="Markdown"
+        )
+
+
+def is_valid_packing_date(r: Dict[str, Any]) -> bool:
+    """Chỉ chấp nhận các dòng có ngày đóng hàng là Hôm nay, Ngày mai, Ngày mốt, Ngày kia (Tổng 4 ngày)"""
+    today = datetime.now(tms_api.VN_TZ)
+    valid_dates = {(today + timedelta(days=off)).strftime("%d/%m/%Y") for off in [0, 1, 2, 3]}
+    valid_iso = {(today + timedelta(days=off)).strftime("%Y-%m-%d") for off in [0, 1, 2, 3]}
+
+    raw_ngay = str(r.get("ngay_dong") or "").strip()
+    if raw_ngay:
+        m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw_ngay)
+        if m:
+            std_d = f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{int(m.group(3))}"
+            return std_d in valid_dates
+    date_q = str(r.get("date_queried") or "").strip()
+    if date_q:
+        return date_q in valid_iso
+    return True
+
+
 async def handle_query_search(update: Update, query: str):
     """Tìm kiếm thông minh đa năng: số cont, mã booking, tên khách hàng, tên hàng hóa (Gạo, Bia...), số xe, POD..."""
     wait_msg = await update.message.reply_text(f"🔍 Đang tra cứu `{query}` trên tab XUẤT - ALL của TMS...")
@@ -294,10 +610,11 @@ async def handle_query_search(update: Update, query: str):
         if not tms_api.is_logged_in:
             await tms_api.login()
 
-        results = await tms_api.search_containers(query)
+        raw_results = await tms_api.search_containers(query)
+        results = [r for r in raw_results if is_valid_packing_date(r)]
         if not results:
             await wait_msg.edit_text(
-                f"❌ Không tìm thấy container/booking nào khớp với **'{query}'** trong phạm vi 7 ngày gần đây.\n\n"
+                f"❌ Không tìm thấy container/booking nào khớp với **'{query}'** trong phạm vi kế hoạch (Hôm nay, Ngày mai, Ngày mốt, Ngày kia).\n\n"
                 f"💡 **Gợi ý tra cứu linh hoạt:**\n"
                 f"• **Số Cont / Mã Booking:** VD `GAOU2111920`, `300170`\n"
                 f"• **Tên Khách Hàng:** VD `Liwayway`, `liwayway`, `Tiền`, `Phong`\n"
@@ -353,13 +670,15 @@ async def handle_customer_search(
             await tms_api.login()
 
         if preloaded_results is not None:
-            results = preloaded_results
+            raw_results = preloaded_results
         else:
-            results = await tms_api.search_containers(clean_q)
+            raw_results = await tms_api.search_containers(clean_q)
+
+        results = [r for r in raw_results if is_valid_packing_date(r)]
 
         if not results:
             await wait_msg.edit_text(
-                f"❌ Không tìm thấy container nào khớp với **'{clean_q}'** trong phạm vi 7 ngày gần đây.\n\n"
+                f"❌ Không tìm thấy container nào khớp với **'{clean_q}'** trong phạm vi kế hoạch (Hôm nay, Ngày mai, Ngày mốt, Ngày kia).\n\n"
                 f"💡 **Gợi ý:**\n"
                 f"• Thử từ khóa ngắn hơn: `liwayway`, `Gạo`, `gao`, `Tiền`, `Phong`.\n"
                 f"• Kiểm tra gõ `/status` để xem TMS có đang kết nối bình thường không.\n"
@@ -431,6 +750,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     parts = data.split("_")
     action = parts[0]
+
+    if action == "viewday":
+        off = int(parts[1])
+        date_iso = parts[2]
+        today = datetime.now(tms_api.VN_TZ)
+        d_obj = today + timedelta(days=off)
+        labels = ["Hôm nay", "Ngày mai (+1)", "Ngày mốt (+2)", "Ngày kia (+3)"]
+        lbl = labels[off] if off < len(labels) else f"Ngày {d_obj.strftime('%d/%m')}"
+        await handle_date_plan_display(
+            query,
+            date_iso=date_iso,
+            date_dmy=d_obj.strftime("%d/%m/%Y"),
+            label=lbl,
+            is_callback=True
+        )
+        return
 
     if action == "refresh":
         row_id = parts[1]
@@ -607,7 +942,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_customer_search(update, query_kh)
             return
 
-    # 4. Nếu là văn bản 1 dòng (Số cont, Mã booking, Tên khách hàng, Hàng hóa, Xe...) ➔ Tra cứu đa năng
+    # 4. Kiểm tra từ khóa xem kế hoạch đóng hàng theo ngày (VD: mai, mốt, kia, 17/10, mai Tiền, plan...)
+    if "\n" not in text:
+        clean_low = text.lower().strip()
+        if clean_low in ("ke hoach", "kế hoạch", "kehoach", "plan", "lich", "lịch"):
+            await handle_plan_overview(update)
+            return
+
+        dt_res, extra = extract_date_and_query(text)
+        if dt_res:
+            date_iso, date_dmy, label = dt_res
+            await handle_date_plan_display(
+                update,
+                date_iso=date_iso,
+                date_dmy=date_dmy,
+                label=label,
+                filter_keyword=extra,
+                is_callback=False,
+            )
+            return
+
+    # 5. Nếu là văn bản 1 dòng (Số cont, Mã booking, Tên khách hàng, Hàng hóa, Xe...) ➔ Tra cứu đa năng
     if "\n" not in text:
         await handle_query_search(update, text)
         return
@@ -671,14 +1026,25 @@ async def handle_batch_pod_update(
     """
     wait_msg = await update.message.reply_text("🤖 Đang dùng Gemini AI nhận diện danh sách Số Cont & Cảng đến (POD)...")
     try:
-        assignments = extract_pod_assignments(text_content=text_content, image_bytes=image_bytes)
+        assignments, err_detail = extract_pod_assignments(text_content=text_content, image_bytes=image_bytes)
         if not assignments:
-            await wait_msg.edit_text(
-                "❌ Không nhận diện được cặp Số Container & Cảng đến (POD) nào từ nội dung bạn gửi.\n\n"
-                "💡 Vui lòng đảm bảo:\n"
-                "• Hình ảnh bảng điều độ rõ nét, nhìn rõ cột số cont và cột cảng đến (CLO, DAN, HPG...).\n"
-                "• Hoặc gửi danh sách text có định dạng: `DRYU2901546 DAN`"
+            err_msg = "❌ **Không nhận diện được cặp Số Container & Cảng đến (POD) nào từ nội dung bạn gửi.**\n\n"
+            if err_detail:
+                err_msg += f"🔍 **Chi tiết kỹ thuật từ hệ thống:**\n`{err_detail}`\n\n"
+            err_msg += (
+                "💡 **Gợi ý kiểm tra & Khắc phục:**\n"
+                "• Gõ `/models` để kiểm tra bot đã kết nối được Google Gemini API chưa.\n"
+                "• Đảm bảo file `.env` trên VPS đã điền `GEMINI_API_KEY=...` chuẩn của Google AI Studio.\n"
+                "• Hình ảnh bảng điều độ rõ nét (nhìn rõ cột cont và cột cảng đến CLO, DAN, HPG...).\n"
+                "• Hoặc bạn có thể dán trực tiếp danh sách text theo định dạng:\n"
+                "```\n"
+                "POD\n"
+                "DRYU2853598 CLO\n"
+                "DRYU2923340 CLO\n"
+                "CAIU6870817 DAN\n"
+                "```"
             )
+            await wait_msg.edit_text(err_msg, parse_mode="Markdown")
             return
 
         total = len(assignments)
@@ -874,16 +1240,37 @@ def create_telegram_app() -> Application:
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("models", models_cmd))
     app.add_handler(CommandHandler("tim", tim_cmd))
     app.add_handler(CommandHandler("kh", kh_cmd))
     app.add_handler(CommandHandler("xoa", xoa_cmd))
     app.add_handler(CommandHandler("pod", pod_cmd))
+    for cmd_name in ["ngay", "plan", "kehoach", "lich", "mai", "mot", "kia", "homnay"]:
+        app.add_handler(CommandHandler(cmd_name, ngay_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     tg_app = app
     return app
+
+
+async def tms_keepalive_worker():
+    """Chạy ngầm định kỳ mỗi 3 phút để duy trì phiên TMS và giữ tab XUẤT - ALL luôn sẵn sàng 24/7"""
+    while True:
+        try:
+            await asyncio.sleep(180)  # 3 phút (thay vì 8 phút)
+            logger.info("⏰ Ping keepalive: duy trì phiên TMS Vietsun tab XUẤT - ALL...")
+            if not tms_api.is_logged_in:
+                await tms_api.login()
+            else:
+                await tms_api.ensure_export_view()
+                today_str = datetime.now(tms_api.VN_TZ).strftime("%Y-%m-%d")
+                await tms_api.fetch_table_for_date(today_str, force_refresh=True)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Lỗi keepalive worker: {e}")
 
 
 @asynccontextmanager
@@ -895,6 +1282,9 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Đã kết nối và đăng nhập sẵn sàng vào VSHO TMS tab XUẤT - ALL!")
     except Exception as e:
         logger.warning(f"⚠️ Chưa thể đăng nhập TMS lúc khởi động (sẽ tự thử lại khi có yêu cầu): {e}")
+
+    # Bật worker duy trì phiên TMS ngầm
+    keepalive_task = asyncio.create_task(tms_keepalive_worker())
 
     if config.TELEGRAM_BOT_TOKEN:
         tg = create_telegram_app()
@@ -910,6 +1300,12 @@ async def lifespan(app: FastAPI):
                 await tg.updater.start_polling()
 
     yield
+    keepalive_task.cancel()
+    try:
+        await keepalive_task
+    except asyncio.CancelledError:
+        pass
+
     if tg_app:
         logger.info("Dừng bot Telegram...")
         if tg_app.updater and tg_app.updater.running:
@@ -932,6 +1328,42 @@ async def telegram_webhook(update_data: dict):
     return {"status": "ok"}
 
 
+async def main_polling():
+    """Chạy độc lập chế độ Polling trên VPS: Không cần mở cổng web, không sợ đụng cổng, tự động ngắt webhook Render cũ"""
+    logger.info("Khởi động bot ở chế độ Polling trên VPS...")
+    try:
+        await tms_api.login()
+        logger.info("✅ Đã kết nối và đăng nhập sẵn sàng vào VSHO TMS tab XUẤT - ALL!")
+    except Exception as e:
+        logger.warning(f"⚠️ Chưa thể đăng nhập TMS lúc khởi động (sẽ tự thử lại khi có yêu cầu): {e}")
+
+    # Bật worker duy trì phiên TMS ngầm
+    asyncio.create_task(tms_keepalive_worker())
+
+    if config.TELEGRAM_BOT_TOKEN:
+        tg = create_telegram_app()
+        if tg:
+            await tg.initialize()
+            # Tự động ngắt Webhook cũ của Render để VPS giành quyền nhận tin nhắn ngay lập tức
+            try:
+                await tg.bot.delete_webhook(drop_pending_updates=True)
+                logger.info("🚀 Đã ngắt Webhook Render cũ thành công! VPS đã giành quyền nhận tin nhắn.")
+            except Exception as e_del:
+                logger.warning(f"Lỗi xóa webhook: {e_del}")
+
+            await tg.start()
+            await tg.updater.start_polling()
+            logger.info("🎉 Bot đã sẵn sàng nhận tin nhắn trên Telegram 24/7!")
+
+            # Giữ tiến trình chạy vĩnh viễn
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+
+
 if __name__ == "__main__":
-    # Chạy trực tiếp qua uvicorn trên cổng config.PORT
-    uvicorn.run("app:web_app", host="0.0.0.0", port=config.PORT, reload=False)
+    if config.WEBHOOK_URL:
+        # Nếu có cấu hình WEBHOOK_URL -> chạy web server FastAPI bằng uvicorn
+        uvicorn.run("app:web_app", host="0.0.0.0", port=config.PORT, reload=False)
+    else:
+        # Nếu chạy Polling trên VPS -> chạy trực tiếp KHÔNG CẦN CỔNG WEB, KHÔNG LO BỊ LỖI [Errno 98]!
+        asyncio.run(main_polling())

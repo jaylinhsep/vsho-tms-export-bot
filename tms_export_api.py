@@ -473,6 +473,16 @@ class TMSExportApiClient:
         if clean_q in clean_note:
             score = max(score, 45)
 
+        # 11. Ngày đóng hàng (ngay_dong / ngayTraHang)
+        raw_ngay = str(row.get("ngay_dong", "")).strip()
+        if raw_ngay:
+            m_d = re.search(r"(\d{1,2})[-/](\d{1,2})(?:[-/](\d{4}))?", raw_ngay)
+            if m_d:
+                d_ddmm = f"{int(m_d.group(1)):02d}/{int(m_d.group(2)):02d}"
+                d_full = f"{int(m_d.group(1)):02d}/{int(m_d.group(2)):02d}/{m_d.group(3)}" if m_d.group(3) else d_ddmm
+                if clean_q in (d_ddmm, d_full) or clean_q == d_ddmm.replace("/", ""):
+                    score = max(score, 85)
+
         return (score > 0), score
 
     async def search_containers(self, query: str) -> List[Dict[str, Any]]:
@@ -497,11 +507,11 @@ class TMSExportApiClient:
         logger.info(f"🔍 Đang tìm kiếm đa năng '{query}' (chuẩn hóa: '{clean_q}') trên TMS...")
         today_rows = await self.fetch_table_for_date(today_str, force_refresh=False)
 
-        # Danh sách các ngày lân cận (-3 đến +3 ngày)
-        other_offsets = [-1, -2, -3, 1, 2, 3]
+        # Danh sách các ngày kế hoạch đóng hàng: Ngày mai (+1), Ngày mốt (+2), Ngày kia (+3) (Tổng 4 ngày)
+        other_offsets = [1, 2, 3]
         other_dates = [(today + timedelta(days=off)).strftime("%Y-%m-%d") for off in other_offsets]
 
-        # Tải song song các ngày lân cận để tối ưu tốc độ phản hồi (<1.5s)
+        # Tải song song các ngày để tối ưu tốc độ phản hồi cực nhanh trên VPS (<0.5s)
         tasks = [self.fetch_table_for_date(d, force_refresh=False) for d in other_dates]
         other_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -509,6 +519,25 @@ class TMSExportApiClient:
         for r_list in other_results:
             if isinstance(r_list, list):
                 all_day_rows.extend(r_list)
+
+        # Cơ chế Auto-Retry: Nếu nhận về 0 dòng trong cả 4 ngày ➔ Chắc chắn phiên TMS bị hết hạn/logout ngầm
+        if len(all_day_rows) == 0:
+            logger.warning("⚠️ Nhận về 0 container trong 4 ngày kế hoạch, phát hiện phiên TMS đã hết hạn. Đang tự động đăng nhập lại và quét lại ngay...")
+            self.cache_date.clear()
+            self.cache_time.clear()
+            await self.login()
+            today_rows = await self.fetch_table_for_date(today_str, force_refresh=True)
+            tasks = [self.fetch_table_for_date(d, force_refresh=True) for d in other_dates]
+            other_results = await asyncio.gather(*tasks, return_exceptions=True)
+            all_day_rows = list(today_rows)
+            for r_list in other_results:
+                if isinstance(r_list, list):
+                    all_day_rows.extend(r_list)
+
+        # Tập hợp các ngày hợp lệ được phép truy xuất: Hôm nay, Ngày mai, Ngày mốt, Ngày kia (Tổng 4 ngày)
+        valid_offsets = [0, 1, 2, 3]
+        valid_dates_ddmmyyyy = {(today + timedelta(days=off)).strftime("%d/%m/%Y") for off in valid_offsets}
+        valid_dates_iso = {(today + timedelta(days=off)).strftime("%Y-%m-%d") for off in valid_offsets}
 
         matched_list: List[Tuple[Dict[str, Any], int]] = []
         seen_row_ids: Set[str] = set()
@@ -518,6 +547,18 @@ class TMSExportApiClient:
             if not row_id or row_id in seen_row_ids:
                 continue
 
+            # LỌC CHẶN NGÀY ĐÓNG HÀNG: Chỉ lấy đúng 4 ngày (Hôm nay, Ngày mai, Ngày mốt, Ngày kia)
+            raw_ngay_dong = str(r.get("ngay_dong", "")).strip()
+            if raw_ngay_dong:
+                m_date = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw_ngay_dong)
+                if m_date:
+                    std_date = f"{int(m_date.group(1)):02d}/{int(m_date.group(2)):02d}/{int(m_date.group(3))}"
+                    if std_date not in valid_dates_ddmmyyyy:
+                        # Bỏ qua hoàn toàn các dòng của ngày cũ (VD: ngày 14/10) hoặc ngày quá xa
+                        continue
+            elif r.get("date_queried") and r.get("date_queried") not in valid_dates_iso:
+                continue
+
             is_matched, score = self.row_matches_query(r, clean_q, query)
             if is_matched:
                 seen_row_ids.add(row_id)
@@ -525,6 +566,43 @@ class TMSExportApiClient:
                 if r.get("date_queried") == today_str or r.get("ngay_dong") == today.strftime("%d/%m/%Y"):
                     score += 5
                 matched_list.append((r, score))
+
+        # TỰ ĐỘNG ĐĂNG NHẬP LẠI & QUÉT TƯƠI NẾU KHÔNG TÌM THẤY (Bảo vệ tuyệt đối khi phiên TMS bị logout ngầm)
+        if not matched_list:
+            logger.info(f"🔄 Chưa tìm thấy kết quả cho '{query}', tự động làm mới phiên TMS và ghim lại tab XUẤT - ALL...")
+            self.cache_date.clear()
+            self.cache_time.clear()
+            login_ok = await self.login()
+            if login_ok:
+                fresh_today = await self.fetch_table_for_date(today_str, force_refresh=True)
+                tasks_fresh = [self.fetch_table_for_date(d, force_refresh=True) for d in other_dates]
+                other_fresh_res = await asyncio.gather(*tasks_fresh, return_exceptions=True)
+                fresh_all = list(fresh_today)
+                for r_list in other_fresh_res:
+                    if isinstance(r_list, list):
+                        fresh_all.extend(r_list)
+
+                for r in fresh_all:
+                    row_id = str(r.get("row_id", "")).strip()
+                    if not row_id or row_id in seen_row_ids:
+                        continue
+
+                    raw_ngay_dong = str(r.get("ngay_dong", "")).strip()
+                    if raw_ngay_dong:
+                        m_date = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", raw_ngay_dong)
+                        if m_date:
+                            std_date = f"{int(m_date.group(1)):02d}/{int(m_date.group(2)):02d}/{int(m_date.group(3))}"
+                            if std_date not in valid_dates_ddmmyyyy:
+                                continue
+                    elif r.get("date_queried") and r.get("date_queried") not in valid_dates_iso:
+                        continue
+
+                    is_matched, score = self.row_matches_query(r, clean_q, query)
+                    if is_matched:
+                        seen_row_ids.add(row_id)
+                        if r.get("date_queried") == today_str or r.get("ngay_dong") == today.strftime("%d/%m/%Y"):
+                            score += 5
+                        matched_list.append((r, score))
 
         # Sắp xếp kết quả: Điểm khớp cao nhất lên đầu, sau đó theo ID mới nhất
         matched_list.sort(
@@ -546,6 +624,43 @@ class TMSExportApiClient:
     async def find_containers_by_customer(self, customer_query: str) -> List[Dict[str, Any]]:
         """Tra cứu container theo Tên Khách Hàng hoặc từ khóa bất kỳ"""
         return await self.search_containers(customer_query)
+
+    async def get_plan_summary_4_days(self) -> List[Dict[str, Any]]:
+        """Lấy tóm tắt số lượng container đóng hàng của 4 ngày (Hôm nay, +1, +2, +3)"""
+        if not self.is_logged_in:
+            await self.login()
+        today = datetime.now(VN_TZ)
+        days_info = []
+        labels = ["Hôm nay", "Ngày mai (+1)", "Ngày mốt (+2)", "Ngày kia (+3)"]
+
+        dates_iso = [(today + timedelta(days=off)).strftime("%Y-%m-%d") for off in range(4)]
+        tasks = [self.fetch_table_for_date(d, force_refresh=False) for d in dates_iso]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for off, (d_iso, r_list) in enumerate(zip(dates_iso, results)):
+            d_obj = today + timedelta(days=off)
+            count = len(r_list) if isinstance(r_list, list) else 0
+            days_info.append({
+                "offset": off,
+                "label": labels[off],
+                "date_iso": d_iso,
+                "date_dmy": d_obj.strftime("%d/%m/%Y"),
+                "date_dm": d_obj.strftime("%d/%m"),
+                "count": count,
+                "rows": r_list if isinstance(r_list, list) else []
+            })
+        return days_info
+
+    async def fetch_rows_for_date_clean(self, date_iso: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """Lấy toàn bộ container của một ngày cụ thể trên TMS"""
+        if not self.is_logged_in:
+            await self.login()
+        rows = await self.fetch_table_for_date(date_iso, force_refresh=force_refresh)
+        if not rows:
+            # Tự động đăng nhập lại và lấy lại nếu nhận về 0 rows
+            await self.login()
+            rows = await self.fetch_table_for_date(date_iso, force_refresh=True)
+        return rows
 
     async def update_field(self, row_id: str, row_timestamp: str, field_name: str, new_value: str, clear_cache: bool = True) -> bool:
         """
